@@ -104,9 +104,9 @@ void loop() {
   }
 
   // Xuất ra Plotter
-  Serial.print(vReal[4] * 1000);  // biên độ tần số thấp (4~8Hz)
+ // Serial.print(vReal[4] * 1000);  // biên độ tần số thấp (4~8Hz)
   Serial.print("\t");
   Serial.println(dB);
 
-  delay(10);
+  delay(50);
 }
