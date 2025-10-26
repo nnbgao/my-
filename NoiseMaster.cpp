@@ -157,7 +157,7 @@ void NoiseMaster::OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t
     if (!esp_now_is_peer_exist(mac_addr)) {
         esp_now_peer_info_t peerInfo = {};
         memcpy(peerInfo.peer_addr, mac_addr, 6); 
-        peerInfo.channel = 0;
+        peerInfo.channel = 1;
         peerInfo.encrypt = false;
         
         if (esp_now_add_peer(&peerInfo) != ESP_OK) {
