@@ -36,7 +36,7 @@ void NoiseMaster::begin() {
     Serial.print("Địa chỉ MAC của Master: ");
     Serial.println(WiFi.macAddress());
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(_ssid, _password);
+    WiFi.softAP(_ssid, _password, 1);
     Serial.print("WiFi Master phát tại: ");
     Serial.println(WiFi.softAPIP());
     _server.on("/data", HTTP_GET, NoiseMaster::handleData);
