@@ -1,5 +1,5 @@
 /*
- * NoiseMaster.cpp - File thực thi logic
+ * NoiseMaster.cpp - File thực thi logic (ĐÃ CẬP NHẬT v3.0)
  */
 
 #include "NoiseMaster.h"
@@ -21,9 +21,7 @@ NoiseMaster::NoiseMaster(const char* ssid, const char* password) : _server(80) {
 
 // --- Hàm Begin (chạy trong setup) ---
 void NoiseMaster::begin() {
-  // Gán con trỏ instance cho chính nó, để các hàm static có thể dùng
   instance = this;
-
   Serial.println("Khởi động NoiseMaster Library...");
 
   // --- Khởi tạo Pin ---
@@ -40,8 +38,6 @@ void NoiseMaster::begin() {
   WiFi.softAP(_ssid, _password);
   Serial.print("WiFi Master phát tại: ");
   Serial.println(WiFi.softAPIP());
-
-  // Đăng ký callback cho WebServer (dùng hàm static)
   _server.on("/data", HTTP_GET, NoiseMaster::handleData);
   _server.begin();
   Serial.println("HTTP Server đã sẵn sàng!");
@@ -51,7 +47,6 @@ void NoiseMaster::begin() {
     Serial.println("ESP-NOW khởi tạo thất bại!");
     return;
   }
-  // Đăng ký callback ESP-NOW (dùng hàm static)
   esp_now_register_recv_cb(NoiseMaster::OnDataRecv);
   esp_now_register_send_cb(NoiseMaster::OnDataSent);
 }
@@ -59,7 +54,114 @@ void NoiseMaster::begin() {
 // --- Hàm Loop (chạy trong loop) ---
 void NoiseMaster::loop() {
   _server.handleClient(); 
-  checkButton(); // Gọi hàm private
+  checkButton(); 
+}
+
+// --- Hàm Public Getters ---
+float NoiseMaster::getDb() {
+  return _lastDB;
+}
+
+float NoiseMaster::getAngle() {
+  return _lastAngle;
+}
+
+// --- HÀM PRIVATE ---
+
+void NoiseMaster::sendCommandToSlave() {
+  if (!_slaveMacKnown) {
+    Serial.println("Chưa biết địa chỉ Slave (chờ Slave gửi tin nhắn đầu tiên)");
+    return;
+  }
+  struct_command cmd;
+  cmd.command = 1; // Gửi lệnh 1
+  esp_now_send(_slaveMacAddress, (uint8_t *) &cmd, sizeof(cmd));
+}
+
+void NoiseMaster::checkButton() {
+  int reading = digitalRead(PIN_BUTTON);
+  if (reading != _lastButtonState) {
+    _lastDebounceTime = millis();
+  }
+  if ((millis() - _lastDebounceTime) > _debounceDelay) {
+    if (reading != _buttonState) {
+      _buttonState = reading;
+      if (_buttonState == LOW) {
+        Serial.println("Phát hiện nhấn nút! Gửi tín hiệu (1) đến Slave...");
+        sendCommandToSlave(); 
+      }
+    }
+  }
+  _lastButtonState = reading;
+}
+
+// --- HÀM CALLBACK STATIC ---
+
+// Hàm OnDataSent không thay đổi
+void NoiseMaster::OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Gửi tín hiệu đến Slave: ");
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    Serial.println("Thành công");
+  } else {
+    Serial.println("Thất bại");
+  }
+}
+
+// ✨ ĐÃ SỬA: Cập nhật toàn bộ hàm OnDataRecv
+void NoiseMaster::OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDataBytes, int len) {
+  if (instance == nullptr) return;
+
+  // Lấy địa chỉ MAC từ cấu trúc mới 'recv_info'
+  const uint8_t *mac_addr = recv_info->src_addr;
+
+  // 1. Xử lý dữ liệu
+  if (len == sizeof(instance->_incomingData)) {
+    memcpy(&instance->_incomingData, incomingDataBytes, sizeof(instance->_incomingData));
+    instance->_lastDB = instance->_incomingData.dB;
+    instance->_lastAngle = instance->_incomingData.angle; 
+
+    Serial.printf("Nhận từ [");
+    for (int i = 0; i < 6; i++) Serial.printf("%02X%s", mac_addr[i], (i < 5) ? ":" : ""); // Dùng mac_addr
+    Serial.printf("]: %.2f dB | Góc %.2f°\n", instance->_lastDB, instance->_lastAngle); 
+    
+    // 2. Logic LED
+    if (instance->_lastDB < 25.0) {
+      digitalWrite(instance->PIN_LED_LOW_DB, HIGH);
+      digitalWrite(instance->PIN_LED_HIGH_DB, LOW);
+    } else {
+      digitalWrite(instance->PIN_LED_LOW_DB, LOW);
+      digitalWrite(instance->PIN_LED_HIGH_DB, HIGH);
+    }
+    
+  } else {
+     Serial.printf("Lỗi: Nhận gói tin không đúng kích thước (%d bytes)\n", len);
+     return;
+  }
+
+  // 3. Tự động thêm Peer (Dùng mac_addr)
+  if (!esp_now_is_peer_exist(mac_addr)) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, mac_addr, 6); // Dùng mac_addr
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("Không thể thêm Slave vào danh sách peer");
+    } else {
+      Serial.println("Đã thêm Slave vào danh sách peer để chuẩn bị gửi tín hiệu.");
+      memcpy(instance->_slaveMacAddress, mac_addr, 6); // Dùng mac_addr
+      instance->_slaveMacKnown = true;
+    }
+  }
+}
+
+// Hàm handleData không thay đổi
+void NoiseMaster::handleData() {
+  if (instance == nullptr) return;
+  float currentDB = instance->_lastDB;
+  float currentAngle = instance->_lastAngle; 
+  String json = "{\"dB\":" + String(currentDB, 2) + ",\"angle\":" + String(currentAngle, 2) + "}";
+  instance->_server.send(200, "application/json", json);
 }
 
 // --- Hàm Public Getters ---
