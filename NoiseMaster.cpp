@@ -17,7 +17,7 @@ NoiseMaster::NoiseMaster(const char* ssid, const char* password) : _server(80) {
     _buttonState = HIGH;
     _lastButtonState = HIGH;
     _lastDebounceTime = 0;
-    // Giả định _debounceDelay đã được khai báo trong .h
+    // Giả định _debounceDelay được định nghĩa trong .h
 }
 
 // --- Hàm Begin (chạy trong setup) ---
@@ -49,7 +49,7 @@ void NoiseMaster::begin() {
         return;
     }
     
-    // ✨ CẬP NHẬT API: Đăng ký hàm nhận (OnDataRecv) và gửi (OnDataSent) với tham số mới
+    // Đăng ký hàm nhận và gửi (sẽ gọi các hàm đã được sửa ở dưới)
     esp_now_register_recv_cb(NoiseMaster::OnDataRecv);
     esp_now_register_send_cb(NoiseMaster::OnDataSent);
 }
@@ -60,7 +60,10 @@ void NoiseMaster::loop() {
     checkButton(); 
 }
 
-// --- Hàm Public Getters ---
+// ------------------------------------
+// --- HÀM PUBLIC GETTERS ---
+// ------------------------------------
+
 float NoiseMaster::getDb() {
     return _lastDB;
 }
@@ -78,9 +81,10 @@ void NoiseMaster::sendCommandToSlave() {
         Serial.println("Chưa biết địa chỉ Slave (chờ Slave gửi tin nhắn đầu tiên)");
         return;
     }
+    
     struct_command cmd;
     cmd.command = 1; // Gửi lệnh 1
-    // Gửi lệnh đến Slave đã biết
+    
     esp_now_send(_slaveMacAddress, (uint8_t *) &cmd, sizeof(cmd));
 }
 
@@ -90,8 +94,7 @@ void NoiseMaster::checkButton() {
     if (reading != _lastButtonState) {
         _lastDebounceTime = millis();
     }
-    // Giả định _debounceDelay được khai báo trong .h
-    if ((millis() - _lastDebounceTime) > _debounceDelay) {
+    if ((millis() - _lastDebounceTime) > _debounceDelay) { // Giả định _debounceDelay hợp lệ
         if (reading != _buttonState) {
             _buttonState = reading;
             if (_buttonState == LOW) {
@@ -105,13 +108,11 @@ void NoiseMaster::checkButton() {
 
 
 // ------------------------------------
-// --- HÀM CALLBACK STATIC MỚI (ESP-NOW & WEB) ---
+// --- HÀM CALLBACK STATIC (ĐÃ CẬP NHẬT API MỚI) ---
 // ------------------------------------
 
-// ✨ CẬP NHẬT API GỬI (OnDataSent)
-// Sử dụng cấu trúc esp_now_send_info_t mới
+// ✅ ĐÃ SỬA LỖI INVALID CONVERSION: Sử dụng cấu trúc esp_now_send_info_t *send_info
 void NoiseMaster::OnDataSent(const esp_now_send_info_t *send_info, esp_now_send_status_t status) {
-    // const uint8_t *mac_addr = send_info->peer_addr; // Lấy MAC nếu cần in chi tiết
     Serial.print("Gửi tín hiệu đến Slave: ");
     if (status == ESP_NOW_SEND_SUCCESS) {
         Serial.println("Thành công");
@@ -121,8 +122,7 @@ void NoiseMaster::OnDataSent(const esp_now_send_info_t *send_info, esp_now_send_
 }
 
 
-// ✨ CẬP NHẬT API NHẬN (OnDataRecv)
-// Sử dụng cấu trúc esp_now_recv_info_t mới
+// ✅ ĐÃ SỬA LỖI TRÙNG LẶP/API: Sử dụng cấu trúc esp_now_recv_info_t *recv_info
 void NoiseMaster::OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDataBytes, int len) {
     if (instance == nullptr) return;
 
@@ -136,11 +136,11 @@ void NoiseMaster::OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t
         instance->_lastAngle = instance->_incomingData.angle; 
 
         Serial.printf("Nhận từ [");
-        for (int i = 0; i < 6; i++) Serial.printf("%02X%s", mac_addr[i], (i < 5) ? ":" : ""); 
+        for (int i = 0; i < 6; i++) Serial.printf("%02X%s", mac_addr[i], (i < 5) ? ":" : "");
         Serial.printf("]: %.2f dB | Góc %.2f°\n", instance->_lastDB, instance->_lastAngle); 
         
         // 2. Logic LED
-        if (instance->_lastDB < 25.0) { // Giả định ngưỡng 25.0 dB
+        if (instance->_lastDB < 25.0) { 
             digitalWrite(instance->PIN_LED_LOW_DB, HIGH);
             digitalWrite(instance->PIN_LED_HIGH_DB, LOW);
         } else {
