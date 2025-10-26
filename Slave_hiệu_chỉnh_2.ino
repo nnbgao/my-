@@ -10,7 +10,7 @@
  * - Sửa hàm đăng ký sang esp_now_register_cbs() cho tương thích.
  * - Thêm 'volatile' để fix lỗi logic hiệu chỉnh.
  */
-
+#include <NoiseMaster.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -145,14 +145,10 @@ void setup() {
   }
 
   // --- ✨ ĐÃ SỬA: Dùng hàm đăng ký API mới ---
-  esp_now_cbs_t cbs;
-  cbs.recv_cb = OnDataRecv;
-  cbs.send_cb = OnDataSent;
+ esp_now_register_recv_cb(NoiseMaster::OnDataRecv);
+esp_now_register_send_cb(NoiseMaster::OnDataSent);
   
-  if (esp_now_register_cbs(&cbs) != ESP_OK) {
-    Serial.println("❌ Lỗi đăng ký Callbacks (cbs)");
-    return;
-  }
+ 
   // --- Hết phần sửa ---
 
   // Thêm Master vào Peer (Đã sửa channel = 1)
