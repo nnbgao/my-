@@ -86,7 +86,8 @@ double calculateRMS(int32_t *data, int samples) {
 
 // --- Callback khi GỬI dữ liệu XONG ---
 // ✨ ĐÃ SỬA: Cập nhật cú pháp API mới (dùng esp_now_send_info_t)
-void OnDataSent(const esp_now_send_info_t *send_info, esp_now_send_status_t status) {
+void OnDataSent(const esp_now_send_info_t *send_info, esp_now_send_status_t status)
+ {
   if (!is_calibrating) {
     if (status == ESP_NOW_SEND_SUCCESS) {
       Serial.println("📤 Gửi thành công");
