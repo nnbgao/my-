@@ -1,22 +1,16 @@
 /**
  * ==============================
- * ESP32 SLAVE - (NHẬN LỆNH 1)
+ * ESP32 SLAVE - (NHẬN LỆNH 1) - ĐÃ SỬA LỖI API
  * ==============================
  * 📘 Chức năng:
  * - Gửi (dB, Angle) cho Master.
  * - NHẬN lệnh (command) từ Master để hiệu chỉnh độ ồn.
- *
- * 🔧 Cập nhật:
- * - Đã xóa logic LED và nút bấm vật lý.
- * - Giữ lại logic nhận lệnh từ Master (command == 1).
- * - Cập nhật cú pháp ESP-NOW API mới (Core v3.0+).
- * - Thời gian hiệu chỉnh là 5 giây.
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-// #include <esp_wifi.h> // Không cần thiết với API mới
+#include <esp_wifi.h> // Đã có trong WiFi.h
 #include <driver/i2s.h>
 #include <math.h>
 
@@ -38,7 +32,6 @@ float cal_sum = 0.0;
 int cal_count = 0;
 
 // --- Địa chỉ MAC của ESP32 Master ---
-// !! QUAN TRỌNG: Đảm bảo địa chỉ này khớp với MAC của Master !!
 uint8_t masterAddress[] = {0xB8, 0xD6, 0x1A, 0xB8, 0x9F, 0x8D};
 
 // --- Cấu trúc dữ liệu GỬI ---
@@ -92,8 +85,8 @@ double calculateRMS(int32_t *data, int samples) {
 }
 
 // --- Callback khi GỬI dữ liệu XONG ---
-// ✨ ĐÃ SỬA: Cập nhật cú pháp API mới
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+// ✨ ĐÃ SỬA: Cập nhật cú pháp API mới (dùng esp_now_send_info_t)
+void OnDataSent(const esp_now_send_info_t *send_info, esp_now_send_status_t status) {
   if (!is_calibrating) {
     if (status == ESP_NOW_SEND_SUCCESS) {
       Serial.println("📤 Gửi thành công");
@@ -104,7 +97,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 // --- Callback khi NHẬN dữ liệu ---
-// ✨ ĐÃ SỬA: Cập nhật cú pháp API mới (Core v3.0+)
+// (Mã này đã đúng)
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDataBytes, int len) {
   struct_command cmd;
   // Kiểm tra độ dài gói tin
@@ -132,15 +125,11 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
 void setup() {
   Serial.begin(115200);
   
-  // Khởi tạo chân nút nhấn (ĐÃ XÓA)
-  // pinMode(BUTTON_PIN, INPUT_PULLUP);
-  
-  // KHỞI TẠO CHÂN LED (ĐÃ XÓA)
-  
   setupI2S();
 
   WiFi.mode(WIFI_STA); 
-  // Ép chạy trên Kênh 1 để đồng bộ với Master (nếu Master cũng set Kênh 1)
+  
+  // ✨ ĐÃ SỬA: Dùng hàm API mới esp_wifi_set_primary_channel()
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
@@ -150,7 +139,7 @@ void setup() {
 
   // --- Đăng ký cả 2 callback GỬI và NHẬN ---
   esp_now_register_send_cb(OnDataSent);
-  esp_now_register_recv_cb(OnDataRecv); // <-- Đã thêm hàm nhận
+  esp_now_register_recv_cb(OnDataRecv); 
 
   // Thêm Master vào Peer
   esp_now_peer_info_t peerInfo = {};
@@ -163,7 +152,7 @@ void setup() {
   }
 
   Serial.println("✅ ESP32 SLAVE khởi động hoàn tất! (Sẵn sàng nhận lệnh 1)");
-  Serial.println("💡 Chờ lệnh hiệu chỉnh (5 giây) từ Master."); // <-- Đã sửa log
+  Serial.println("💡 Chờ lệnh hiệu chỉnh (5 giây) từ Master.");
 }
 
 void loop() {
@@ -174,10 +163,7 @@ void loop() {
   double rms = calculateRMS(buffer, SAMPLES);
   double raw_dB = 20 * log10(rms) + 120; // +120 là offset cho INMP441
   
-  // --- LOGIC HIỆU CHỈNH (Nút bấm CỤC BỘ) --- (ĐÃ XÓA)
-  // if (digitalRead(BUTTON_PIN) == LOW && !is_calibrating) { ... }
-  
-  // --- Xử lý hiệu chỉnh (Chung cho cả 2) ---
+  // --- Xử lý hiệu chỉnh ---
   if (is_calibrating) {
     cal_sum += raw_dB;
     cal_count++;
@@ -217,5 +203,3 @@ void loop() {
 
   delay(50); // Thêm delay nhỏ để ổn định
 }
-
-// --- LOGIC LED --- (ĐÃ XÓA)
