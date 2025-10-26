@@ -4,16 +4,19 @@
  * ==============================
  * 📘 Chức năng:
  * - Gửi (dB, Angle) cho Master.
- * - NHẬN lệnh (command) từ Master.
- * - Hiệu chỉnh độ ồn.
+ * - NHẬN lệnh (command) từ Master để hiệu chỉnh độ ồn.
  *
  * 🔧 Cập nhật:
- * - Sẽ hiệu chỉnh dB khi nhận được lệnh command == 1.
+ * - Đã xóa logic LED và nút bấm vật lý.
+ * - Giữ lại logic nhận lệnh từ Master (command == 1).
+ * - Cập nhật cú pháp ESP-NOW API mới (Core v3.0+).
+ * - Thời gian hiệu chỉnh là 5 giây.
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+// #include <esp_wifi.h> // Không cần thiết với API mới
 #include <driver/i2s.h>
 #include <math.h>
 
@@ -24,12 +27,11 @@
 #define SAMPLE_RATE 16000
 #define SAMPLES 256
 
-// --- Cấu hình Nút nhấn ---
-#define BUTTON_PIN 12 
+// --- Cấu hình Offset Hiệu chỉnh ---
 float db_offset = 0.0; 
 
 // --- Cấu hình Hiệu chỉnh ---
-const long CALIBRATION_TIME_MS = 5000;
+const long CALIBRATION_TIME_MS = 5000; // 5 giây
 long cal_start_time = 0;
 bool is_calibrating = false;
 float cal_sum = 0.0;
@@ -90,6 +92,7 @@ double calculateRMS(int32_t *data, int samples) {
 }
 
 // --- Callback khi GỬI dữ liệu XONG ---
+// ✨ ĐÃ SỬA: Cập nhật cú pháp API mới
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   if (!is_calibrating) {
     if (status == ESP_NOW_SEND_SUCCESS) {
@@ -101,7 +104,8 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 }
 
 // --- Callback khi NHẬN dữ liệu ---
-void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingDataBytes, int len) {
+// ✨ ĐÃ SỬA: Cập nhật cú pháp API mới (Core v3.0+)
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDataBytes, int len) {
   struct_command cmd;
   // Kiểm tra độ dài gói tin
   if (len == sizeof(cmd)) {
@@ -118,7 +122,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingDataBytes, int l
       cal_start_time = millis();
       cal_sum = 0.0;
       cal_count = 0;
-      Serial.printf("\n*** BẮT ĐẦU HIỆU CHỈNH (TỪ XA) - GIỮ YÊN LẶNG (2 GIÂY) ***\n");
+      Serial.printf("\n*** BẮT ĐẦU HIỆU CHỈNH (TỪ XA) - GIỮ YÊN LẶNG (5 GIÂY) ***\n");
     }
   } else {
     Serial.println("Lỗi: Nhận được gói lệnh không đúng kích thước.");
@@ -128,10 +132,16 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingDataBytes, int l
 void setup() {
   Serial.begin(115200);
   
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Khởi tạo chân nút nhấn (ĐÃ XÓA)
+  // pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  // KHỞI TẠO CHÂN LED (ĐÃ XÓA)
   
   setupI2S();
+
   WiFi.mode(WIFI_STA); 
+  // Ép chạy trên Kênh 1 để đồng bộ với Master (nếu Master cũng set Kênh 1)
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("❌ Lỗi khởi tạo ESP-NOW");
@@ -140,7 +150,7 @@ void setup() {
 
   // --- Đăng ký cả 2 callback GỬI và NHẬN ---
   esp_now_register_send_cb(OnDataSent);
-  esp_now_register_recv_cb(OnDataRecv); 
+  esp_now_register_recv_cb(OnDataRecv); // <-- Đã thêm hàm nhận
 
   // Thêm Master vào Peer
   esp_now_peer_info_t peerInfo = {};
@@ -153,7 +163,7 @@ void setup() {
   }
 
   Serial.println("✅ ESP32 SLAVE khởi động hoàn tất! (Sẵn sàng nhận lệnh 1)");
-  Serial.printf("💡 Nhấn nút (GPIO %d) hoặc chờ lệnh từ Master để hiệu chỉnh.\n", BUTTON_PIN);
+  Serial.println("💡 Chờ lệnh hiệu chỉnh (5 giây) từ Master."); // <-- Đã sửa log
 }
 
 void loop() {
@@ -164,14 +174,8 @@ void loop() {
   double rms = calculateRMS(buffer, SAMPLES);
   double raw_dB = 20 * log10(rms) + 120; // +120 là offset cho INMP441
   
-  // --- LOGIC HIỆU CHỈNH (Nút bấm CỤC BỘ) ---
-  if (digitalRead(BUTTON_PIN) == LOW && !is_calibrating) {
-    is_calibrating = true;
-    cal_start_time = millis();
-    cal_sum = 0.0;
-    cal_count = 0;
-    Serial.printf("\n*** BẮT ĐẦU HIỆU CHỈNH (CỤC BỘ) - GIỮ YÊN LẶNG (2 GIÂY) ***\n");
-  }
+  // --- LOGIC HIỆU CHỈNH (Nút bấm CỤC BỘ) --- (ĐÃ XÓA)
+  // if (digitalRead(BUTTON_PIN) == LOW && !is_calibrating) { ... }
   
   // --- Xử lý hiệu chỉnh (Chung cho cả 2) ---
   if (is_calibrating) {
@@ -181,7 +185,7 @@ void loop() {
     long elapsed = millis() - cal_start_time;
     Serial.printf("\rThu thập: %.2f giây. Đã đọc %d mẫu...", (float)elapsed / 1000.0, cal_count);
 
-    if (elapsed >= CALIBRATION_TIME_MS) {
+    if (elapsed >= CALIBRATION_TIME_MS) { // Sẽ kiểm tra với 5000ms
       is_calibrating = false;
       if (cal_count > 0) {
         db_offset = cal_sum / cal_count;
@@ -213,3 +217,5 @@ void loop() {
 
   delay(50); // Thêm delay nhỏ để ổn định
 }
+
+// --- LOGIC LED --- (ĐÃ XÓA)
