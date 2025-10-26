@@ -63,7 +63,7 @@ class NoiseMaster {
     // ✅ ĐÃ SỬA: Cập nhật chữ ký hàm OnDataSent để khớp với API ESP-NOW mới
     static void OnDataSent(const esp_now_send_info_t *send_info, esp_now_send_status_t status);
     
-    // ✅ ĐÃ SỬA: Cập nhật chữ ký hàm OnDataRecv
+    // Khai báo OnDataRecv (đã đúng)
     static void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDataBytes, int len);
     
     static void handleData();
