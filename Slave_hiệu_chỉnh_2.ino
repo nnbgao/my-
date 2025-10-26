@@ -49,9 +49,6 @@ typedef struct {
 SoundData soundPacket;
 
 // --- Cấu trúc dữ liệu NHẬN từ Master ---
-typedef struct struct_command {
-  int command; 
-} struct_command;
 
 // --- Hàm khởi tạo I2S --- (Không thay đổi)
 void setupI2S() {
@@ -145,8 +142,6 @@ void setup() {
   }
 
   // --- ✨ ĐÃ SỬA: Dùng hàm đăng ký API mới ---
- esp_now_register_recv_cb(NoiseMaster::OnDataRecv);
-esp_now_register_send_cb(NoiseMaster::OnDataSent);
   
  
   // --- Hết phần sửa ---
