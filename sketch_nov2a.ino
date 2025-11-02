@@ -160,7 +160,7 @@ esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
   // Thêm Master làm peer (để gửi dữ liệu cho Master)
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, masterAddress, 6);
-  peerInfo.channel = 0;
+  peerInfo.channel = 1;
   peerInfo.encrypt = false;
   
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
