@@ -182,7 +182,7 @@ void setup() {
   Serial.println(WiFi.macAddress());
 
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid, password);
+  WiFi.softAP(ssid, password, 1);
   Serial.print("WiFi Master phát tại: ");
   Serial.println(WiFi.softAPIP());
 
