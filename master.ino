@@ -1,72 +1,63 @@
-/**
- * ==============================
- * ESP8266 MASTER - NHẬN DỮ LIỆU & GỬI QUA WIFI
- * ==============================
- * 📘 Chức năng:
- *  - Nhận dữ liệu dB từ ESP32 qua ESP-NOW.
- *  - Cung cấp dữ liệu qua HTTP server để laptop có thể truy cập vẽ heatmap.
- */
+#include <esp_now.h>
+#include <WiFi.h>
 
-#include <ESP8266WiFi.h>
-#include <espnow.h>
-#include <ESP8266WebServer.h>
+// Mảng 4 phần tử để lưu 4 giá trị P_mượt
+// P_muot_values[0] = giá trị của Slave 1
+// P_muot_values[1] = giá trị của Slave 2
+// ...
+volatile float P_muot_values[4] = {0.0, 0.0, 0.0, 0.0};
 
-// --- WiFi Access Point để laptop kết nối ---
-const char* ssid = "NoiseMaster";
-const char* password = "12345678";
-
-// --- Biến lưu dữ liệu mới nhất ---
-float lastDB = 0.0;
-float lastAngle = 0.0;
-
-// --- Cấu trúc dữ liệu nhận từ ESP32 ---
+// Cấu trúc dữ liệu (PHẢI GIỐNG HỆT BÊN SLAVE)
 typedef struct struct_message {
-  float dB;
-  float angle;
+  int id;
+  float p_value;
 } struct_message;
 
-struct_message incomingData;
+// Hàm Callback (Hàm gọi lại) - Sẽ tự động chạy khi nhận được dữ liệu
+// DÙNG CÚ PHÁP MỚI CHO THƯ VIỆN ESP32 MỚI
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+  
+  struct_message myData;
+  memcpy(&myData, incomingData, sizeof(myData));
 
-// --- Tạo web server tại cổng 80 ---
-ESP8266WebServer server(80);
+  // Phân loại dữ liệu dựa trên ID mà Slave gửi
+  int slave_id = myData.id;
+  float p_value = myData.p_value;
 
-// --- Callback khi nhận dữ liệu từ ESP32 ---
-void OnDataRecv(uint8_t *mac, uint8_t *incomingDataBytes, uint8_t len) {
-  memcpy(&incomingData, incomingDataBytes, sizeof(incomingData));
-  lastDB = incomingData.dB;
-  lastAngle = incomingData.angle;
-  Serial.printf("Nhận được: %.2f dB | Góc %.2f°\n", lastDB, lastAngle);
+  // Cập nhật giá trị vào đúng mảng
+  // (Trừ 1 vì ID bắt đầu từ 1, nhưng chỉ số mảng bắt đầu từ 0)
+  if (slave_id >= 1 && slave_id <= 4) {
+    P_muot_values[slave_id - 1] = p_value;
+  }
 }
 
-// --- Route HTTP để laptop đọc dữ liệu ---
-void handleData() {
-  String json = "{\"dB\":" + String(lastDB, 2) + ",\"angle\":" + String(lastAngle, 2) + "}";
-  server.send(200, "application/json", json);
-}
-
+// --- HÀM SETUP ---
 void setup() {
   Serial.begin(115200);
+  Serial.println("Day la MASTER. Dang lang nghe...");
+  
+  WiFi.mode(WIFI_STA);
 
-  // --- Tạo WiFi Access Point ---
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid, password);
-  Serial.print("WiFi Master phát tại: ");
-  Serial.println(WiFi.softAPIP());
-
-  // --- Khởi tạo ESP-NOW ---
-  if (esp_now_init() != 0) {
-    Serial.println("ESP-NOW khởi tạo thất bại!");
+  // Khởi tạo ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Loi khoi tao ESP-NOW");
     return;
   }
-  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+  
+  // Đăng ký Hàm Callback Nhận Dữ liệu (Quan trọng nhất)
   esp_now_register_recv_cb(OnDataRecv);
-
-  // --- Cấu hình web server ---
-  server.on("/data", handleData);
-  server.begin();
-  Serial.println("HTTP Server đã sẵn sàng!");
 }
 
+// --- HÀM LOOP ---
 void loop() {
-  server.handleClient(); // Lắng nghe laptop yêu cầu
+  // In 4 giá trị P_mượt ra Serial Monitor (Để kiểm tra)
+  Serial.printf("P1: %.0f | P2: %.0f | P3: %.0f | P4: %.0f \n",
+                P_muot_values[0],
+                P_muot_values[1],
+                P_muot_values[2],
+                P_muot_values[3]);
+
+  // Giai đoạn 3 (IDW và NeoPixel) sẽ được thêm vào đây sau
+  
+  delay(200); // Cập nhật màn hình 5 lần/giây
 }
