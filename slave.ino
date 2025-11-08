@@ -18,7 +18,7 @@ float P_cu = 0.0;
 // --- 3. CẤU HÌNH ESP-NOW ---
 
 // !!! THAY THẾ ĐỊA CHỈ NÀY BẰNG ĐỊA CHỈ MAC MASTER CỦA BẠN (Lấy ở Bước 1)
-uint8_t masterAddress[] = {0x10, 0xB4, 0x1D, 0x50, 0xD6, 0x5C}; 
+uint8_t masterAddress[] = {0xB8, 0xD6, 0x1A, 0xB8, 0x9F, 0x8D}; 
 
 // Cấu trúc dữ liệu để gửi đi
 // Master cần biết 'id' (slave nào) và 'p_value' (giá trị P_mượt)
