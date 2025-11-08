@@ -18,7 +18,7 @@ float P_cu = 0.0;
 // --- 3. CẤU HÌNH ESP-NOW ---
 
 // !!! THAY THẾ ĐỊA CHỈ NÀY BẰNG ĐỊA CHỈ MAC MASTER CỦA BẠN (Lấy ở Bước 1)
-uint8_t masterAddress[] = {0xB8, 0xD6, 0x1A, 0xB8, 0x9F, 0x8D}; 
+uint8_t masterAddress[] = {0xB8, 0xD6, 0x1A, 0xB8, 0x9F, 0x8C}; 
 
 // Cấu trúc dữ liệu để gửi đi
 // Master cần biết 'id' (slave nào) và 'p_value' (giá trị P_mượt)
@@ -29,7 +29,12 @@ typedef struct struct_message {
 
 // Tạo một biến dữ liệu
 struct_message myData;
-
+// CÚ PHÁP MỚI (ĐÃ SỬA LỖI)
+void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  // Bỏ comment dòng dưới nếu bạn muốn xem kết quả
+  Serial.print("Trang thai gui P_muot: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Thanh Cong" : "That Bai");
+}
 // --- 4. HÀM TÍNH P_THÔ (Giữ nguyên) ---
 float tinh_P_tho() {
   unsigned long bat_dau = millis();
@@ -48,18 +53,17 @@ float tinh_P_tho() {
 // --- 5. HÀM SETUP (Thiết lập ADC và ESP-NOW) ---
 void setup() {
   Serial.begin(115200);
-
   // Cài đặt ADC cho C3 (Như bạn đã làm)
   adc1_config_width(ADC_WIDTH_BIT_12);
   adc1_config_channel_atten(ADC1_CHANNEL_2, ADC_ATTEN_DB_11); // Kênh 2 là GPIO 2
-
   // Cài đặt ESP-NOW
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
     Serial.println("Loi khoi tao ESP-NOW");
     return;
   }
-
+  // Đăng ký hàm callback GỬI
+  esp_now_register_send_cb(OnDataSent);
   // Đăng ký "bạn bè" (Master)
   esp_now_peer_info_t peerInfo = {}; // Khởi tạo struct peerInfo
   memcpy(peerInfo.peer_addr, masterAddress, 6);
@@ -80,7 +84,7 @@ void loop() {
   P_cu = P_now;
 
   // Gán dữ liệu vào biến struct
-  myData.id = 1; // !!! THAY SỐ NÀY (1, 2, 3, 4) CHO TỪNG CON SLAVE
+  myData.id = 4; // !!! THAY SỐ NÀY (1, 2, 3, 4) CHO TỪNG CON SLAVE
   myData.p_value = P_now;
 
   // Gửi dữ liệu P_mượt đến Master
