@@ -1,0 +1,214 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <cmath>
+#include <Adafruit_NeoPixel.h>
+// --- Cấu hình chân ---
+const int BUTTON_PIN = 12;
+const int SPEAKER_PIN = 13;
+#define LED_PIN 23
+#define LED_COUNT 16
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+// --- Biến cho nút bấm & Trạng thái ---
+// volatile để báo cho trình biên dịch biết biến này có thể thay đổi trong ngắt
+volatile int count = 0; // 0=Tắt, 1=NeoPixel, 2=Loa
+volatile bool buttonPressed = false; // Cờ báo hiệu nút đã được bấm
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; // Bộ bảo vệ để tránh xung đột dữ liệu
+unsigned long lastDebounceTime = 0; // Thời gian cuối cùng bấm nút (để chống rung)
+unsigned long debounceDelay = 50;   // Thời gian chờ chống rung (50ms)
+
+// --- Mảng lưu giá trị P_mượt từ 4 Slaves ---
+volatile float P_muot_values[4] = {0.0, 0.0, 0.0, 0.0};
+const int NUM_MICS=4;
+const float MIC_POSITIONS[NUM_MICS][2]={
+  {0.0,0.0}, // Mic 1 (Slave 1) mỗi ô trong lớp học là 1 đơn vị
+  {12.0,0.0}, // Mic 2 (Slave 2)
+  {0.0,18.0}, // Mic 3 (Slave 3)
+  {12.0,18.0}, // Mic 4 (Slave 4)
+};
+
+// --- 8 Khu vực ước tính (IDW) ---
+const int NUM_ZONES=8;
+const float ZONE_CENTERS[NUM_ZONES][2]={
+  {4.72, 5.0}, // Zone 1 (Như code gốc của bạn)
+  {4.72, 9.85}, // Zone 2 (Trên trục X, gần mic 1)
+  {8.5, 5.0}, // Zone 3 (Trên trục Y, giữa mic 0-2)
+  {8.5, 9.85}, // Zone 4 (Trên trục X=6, giữa mic 1-3)
+  {13.12, 5.0}, // Zone 5 (Trên trục Y=6, giữa mic 2-3)
+  {13.12, 9.85}, // Zone 6 (Tâm của các mic)
+  {17.95, 5.0}, // Zone 7 (Góc phần tư 2)
+  {17.95, 9.85}, // Zone 8 (Góc phần tư 4)
+};
+
+// --- Hàm tính khoảng cách ---
+double tinh_khoang_cach(double vung_x, double vung_y, double mic_x, double mic_y){
+  double delta_x=vung_x-mic_x;
+  double delta_y=vung_y-mic_y;
+
+  double dinh_b=pow(delta_x,2)+pow(delta_y,2);
+  double distance=sqrt(dinh_b);
+  return distance;
+};
+
+// --- Cấu trúc dữ liệu (PHẢI GIỐNG HỆT BÊN SLAVE) ---
+typedef struct struct_message {
+  int id;
+  float p_value;
+} struct_message;
+
+// --- HÀM NGẮT (ISR) CHO NÚT BẤM ---
+// IRAM_ATTR để lưu hàm này vào RAM cho tốc độ thực thi nhanh
+void IRAM_ATTR handleButtonInterrupt() {
+  // Chống rung cho nút bấm
+  if (millis() - lastDebounceTime > debounceDelay) {
+    portENTER_CRITICAL_ISR(&mux); // Khóa bộ nhớ
+    buttonPressed = true; // Đặt cờ báo
+    lastDebounceTime = millis();
+    portEXIT_CRITICAL_ISR(&mux); // Mở khóa
+  }
+}
+
+// --- HÀM CALLBACK KHI NHẬN DỮ LIỆU ---
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+  
+  struct_message myData;
+  memcpy(&myData, incomingData, sizeof(myData));
+
+  int slave_id = myData.id;
+  float p_value = myData.p_value;
+
+  // Cập nhật giá trị vào đúng mảng
+  if (slave_id >= 1 && slave_id <= 4) {
+    P_muot_values[slave_id - 1] = p_value;
+  }
+}
+
+// --- HÀM SETUP ---
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Day la MASTER. Dang lang nghe...");
+  
+  // Cấu hình chân
+  pinMode(BUTTON_PIN, INPUT_PULLUP); // Nút bấm dùng điện trở kéo lên nội bộ
+  pinMode(SPEAKER_PIN, OUTPUT);
+  digitalWrite(SPEAKER_PIN, LOW); // Tắt loa lúc khởi động
+
+  // Gắn ngắt cho nút bấm, kích hoạt khi có cạnh XUỐNG (nhấn nút)
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, FALLING);
+
+  // Khởi tạo WiFi và ESP-NOW
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Loi khoi tao ESP-NOW");
+    return;
+  }
+  
+  // Đăng ký Hàm Callback Nhận Dữ liệu
+  esp_now_register_recv_cb(OnDataRecv);
+  Serial.println("Khoi dong hoan tat. Mode=0 (Idle).");
+  strip.begin();
+strip.show(); // Tắt hết LED khi khởi động
+strip.setBrightness(50); // Đặt độ sáng (tránh sụt áp)
+}
+
+// --- HÀM LOOP ---
+// 1. XỬ LÝ NÚT BẤM (Đã đúng)
+void loop() {
+  
+  // 1. XỬ LÝ NÚT BẤM (Đã đúng)
+  if (buttonPressed) {
+    portENTER_CRITICAL(&mux); 
+    buttonPressed = false;    
+    portEXIT_CRITICAL(&mux); 
+
+    count++;
+    if (count > 2) {
+      count = 0;
+    }
+
+    if (count == 0) {
+      Serial.println("\n--- MODE 0: IDLE (Tat) ---");
+      noTone(SPEAKER_PIN); 
+      strip.clear(); // Tắt hết LED NeoPixel
+      strip.show();
+    } else if (count == 1) {
+      Serial.println("\n--- MODE 1: NEOPIXEL ---");
+      noTone(SPEAKER_PIN); 
+    } else { // count == 2
+      Serial.println("\n--- MODE 2: SPEAKER ---");
+      strip.clear(); // Tắt hết LED NeoPixel
+      strip.show();
+    }
+  }
+
+  // 2. XỬ LÝ LOGIC CHÍNH THEO TỪNG MODE
+  if (count != 0) { 
+    
+    float P_nguong = 3600;
+    float P_est_zones[NUM_ZONES];
+    bool anyZoneNoisy = false; 
+
+    // Bắt đầu tính toán IDW (Vòng lặp 8 vùng)
+    for (int i = 0; i < NUM_ZONES; i++) {
+      
+      float vung_x = ZONE_CENTERS[i][0];
+      float vung_y = ZONE_CENTERS[i][1];
+      double tong_trong_so = 0.0;
+      double tong_P_nhan_trong_so = 0.0;
+
+      // Vòng lặp 4 micro
+      for (int j = 0; j < NUM_MICS; j++) {
+        float mic_x = MIC_POSITIONS[j][0];
+        float mic_y = MIC_POSITIONS[j][1];
+        double d = tinh_khoang_cach(vung_x, vung_y, mic_x, mic_y);
+        double w = 0.0;
+        if (d > 0.001) { 
+          w = 1.0 / d;
+        } else {
+          w = 10000.0; 
+        }
+        tong_trong_so += w;
+        tong_P_nhan_trong_so += P_muot_values[j] * w;
+      }
+      P_est_zones[i] = tong_P_nhan_trong_so / tong_trong_so;
+
+      // --- LOGIC KIỂM TRA NGƯỠNG (Chạy 8 lần) ---
+      if (P_est_zones[i] > P_nguong) {
+        anyZoneNoisy = true; // Báo hiệu có ít nhất 1 vùng ồn
+      }
+      
+    } // --- Kết thúc vòng lặp 8 vùng (IDW) ---
+
+    
+    // 3. XỬ LÝ OUTPUT DỰA TRÊN MODE
+    
+    if (count == 1) {
+      // --- MODE 1: HIỂN THỊ NEOPIXEL ---
+      
+      for (int i = 0; i < 8; i++) { // Lặp 8 vùng
+        int led_index_1 = i * 2;   
+        int led_index_2 = i * 2 + 1; 
+
+        if (P_est_zones[i] > P_nguong) {
+          strip.setPixelColor(led_index_1, strip.Color(255, 0, 0)); // ĐỎ
+          strip.setPixelColor(led_index_2, strip.Color(255, 0, 0));
+        } else {
+          strip.setPixelColor(led_index_1, strip.Color(0, 255, 0)); // XANH
+          strip.setPixelColor(led_index_2, strip.Color(0, 255, 0));
+        }
+      }
+      strip.show(); // Cập nhật 16 LED 1 lần
+      
+    } 
+    else if (count == 2) {
+      // --- MODE 2: HIỂN THỊ LOA ---
+      if (anyZoneNoisy) { 
+        tone(SPEAKER_PIN, 1000); 
+      } else {
+        noTone(SPEAKER_PIN);
+      }
+    }
+
+  } // kết thúc if(count != 0)
+
+  delay(200); // Cập nhật 5 lần/giây
+}
