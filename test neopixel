@@ -1,0 +1,36 @@
+/*
+ * CODE TEST THỨ TỰ NEOPIXEL 4x4
+ * Nó sẽ lần lượt bật đỏ từng bóng (từ 0 đến 15).
+ */
+
+#include <Adafruit_NeoPixel.h>
+
+// --- Cấu hình NeoPixel ---
+#define LED_PIN    23  // (Đổi lại chân GPIO của bạn nếu khác)
+#define LED_COUNT  16  // (Vì đây là ma trận 4x4)
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+void setup() {
+  strip.begin();
+  strip.setBrightness(30); // Dùng độ sáng thấp để test
+  strip.show(); // Tắt hết LED
+}
+
+void loop() {
+  
+  // Chạy vòng lặp 16 lần (cho 16 bóng LED)
+  for(int i=0; i < LED_COUNT; i++) {
+    
+    // 1. Tắt tất cả các bóng (clear)
+    strip.clear(); 
+    
+    // 2. Chỉ bật bóng thứ 'i' thành màu ĐỎ
+    strip.setPixelColor(i, strip.Color(255, 0, 0)); 
+    
+    // 3. Hiển thị
+    strip.show(); 
+    
+    // 4. Chờ 1 giây để bạn kịp nhìn xem bóng nào vừa sáng
+    delay(1000); 
+  }
+}
