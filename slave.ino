@@ -2,12 +2,13 @@
  * CODE CHO 4 "SLAVE" (ESP32-C3 SUPER MINI)
  * Nhiệm vụ: Tính P_mượt và gửi qua ESP-NOW cho Master.
  */
-
+volatile bool heThongDangBat = true; // Mặc định là Bật khi khởi động
 // --- 1. THÊM CÁC THƯ VIỆN CẦN THIẾT ---
 #include "driver/adc.h" // Cho ADC C3
 #include <esp_now.h>   // Cho ESP-NOW
 #include <WiFi.h>      // Cho ESP-NOW
-
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 // --- 2. CẤU HÌNH CẢM BIẾN (Giống Giai đoạn 1) ---
 const int MIC_PIN = 2; // (Hoặc 3, 4... tùy bạn cắm chân nào)
 const int SAMPLE_WINDOWS = 50;
@@ -29,11 +30,20 @@ typedef struct struct_message {
 
 // Tạo một biến dữ liệu
 struct_message myData;
-// CÚ PHÁP MỚI (ĐÃ SỬA LỖI)
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
   // Bỏ comment dòng dưới nếu bạn muốn xem kết quả
   Serial.print("Trang thai gui P_muot: ");
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Thanh Cong" : "That Bai");
+}
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+  int command;
+  memcpy(&command, incomingData, sizeof(command));
+
+  if (command == 0) {
+    heThongDangBat = false; // Master bảo Tắt
+  } else {
+    heThongDangBat = true;  // Master bảo Bật
+  }
 }
 // --- 4. HÀM TÍNH P_THÔ (Giữ nguyên) ---
 float tinh_P_tho() {
@@ -52,6 +62,7 @@ float tinh_P_tho() {
 
 // --- 5. HÀM SETUP (Thiết lập ADC và ESP-NOW) ---
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //tắt giám sát sụt áp
   Serial.begin(115200);
   // Cài đặt ADC cho C3 (Như bạn đã làm)
   adc1_config_width(ADC_WIDTH_BIT_12);
@@ -62,6 +73,7 @@ void setup() {
     Serial.println("Loi khoi tao ESP-NOW");
     return;
   }
+  esp_now_register_recv_cb(OnDataRecv);// lắng nghe
   // Đăng ký hàm callback GỬI
   esp_now_register_send_cb(OnDataSent);
   // Đăng ký "bạn bè" (Master)
@@ -79,6 +91,7 @@ void setup() {
 // --- 6. HÀM LOOP (Tính toán và Gửi) ---
 void loop() {
   // Tính P_mượt (Giống Giai đoạn 1)
+  if (heThongDangBat){
   float P_thuc_te = tinh_P_tho();
   float P_now = (ALPHA * P_thuc_te) + ((1.0 - ALPHA) * P_cu);
   P_cu = P_now;
@@ -88,7 +101,7 @@ void loop() {
   myData.p_value = P_now;
 
   // Gửi dữ liệu P_mượt đến Master
-  esp_now_send(masterAddress, (uint8_t *) &myData, sizeof(myData));
+  esp_now_send(masterAddress, (uint8_t *) &myData, sizeof(myData));}
 
   delay(100); // Gửi 10 lần mỗi giây
 }
