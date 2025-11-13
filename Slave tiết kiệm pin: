@@ -1,0 +1,120 @@
+/*
+ * CODE SLAVE (PHIÊN BẢN DEEP SLEEP + "ĐÁNH LỪA" MH-CD42)
+ */
+
+// --- 1. THÊM CÁC THƯ VIỆN CẦN THIẾT ---
+#include "driver/adc.h" // Cho ADC C3
+#include <esp_now.h>   // Cho ESP-NOW
+#include <WiFi.h>      // Cho ESP-NOW
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// --- 2. CẤU HÌNH CẢM BIẾN & TẢI GIẢ ---
+const int MIC_PIN = 2; 
+const int KEY_PIN = 4; // <<< THÊM MỚI: Chân kích xung Key (chọn GPIO bất kỳ)
+const int SAMPLE_WINDOWS = 50;
+const int ADC_MAX = 4095;
+const float ALPHA = 0.2; 
+
+// --- 3. BIẾN RTC (LƯU KHI NGỦ) ---
+// (Lưu "ký ức" EMA và trạng thái Bật/Tắt)
+RTC_DATA_ATTR float P_cu = 0.0;       
+RTC_DATA_ATTR bool heThongDangBat = true; // Mặc định Bật
+
+// --- 4. CẤU HÌNH ESP-NOW ---
+uint8_t masterAddress[] = {0xB8, 0xD6, 0x1A, 0xB8, 0x9F, 0x8C}; 
+typedef struct struct_message { int id; float p_value; } struct_message;
+struct_message myData;
+typedef struct struct_command { int command; } struct_command;
+
+// --- 5. CÁC HÀM (CALLBACK & TÍNH P_THÔ) ---
+// (Giữ nguyên các hàm OnDataSent, tinh_P_tho)
+void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  // (Hàm này vẫn chạy để xác nhận gửi)
+}
+float tinh_P_tho() {
+  unsigned long bat_dau = millis();
+  int sample_max = 0; int sample_min = ADC_MAX; int sample;
+  while (millis() < bat_dau + SAMPLE_WINDOWS) {
+    sample = adc1_get_raw(ADC1_CHANNEL_2); 
+    if (sample > sample_max) sample_max = sample;
+    if (sample < sample_min) sample_min = sample;
+    yield(); 
+  }
+  return (float)(sample_max - sample_min);
+}
+
+// Hàm Callback NHẬN (để Master ra lệnh Bật/Tắt)
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+  struct_command myCommand;
+  memcpy(&myCommand, incomingData, sizeof(myCommand));
+  if (myCommand.command == 0) {
+    heThongDangBat = false; 
+  } else {
+    heThongDangBat = true;  
+  }
+}
+
+// --- 6. HÀM SETUP (LOGIC CHÍNH NẰM Ở ĐÂY) ---
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Tắt sụt áp
+  
+  // Serial.begin(115200); // (Nên tắt Serial Monitor khi chạy pin)
+
+  // Cấu hình chân Tải giả (Key)
+  pinMode(KEY_PIN, OUTPUT);
+  digitalWrite(KEY_PIN, HIGH); // Giữ ở mức HIGH (không nhấn)
+
+  // Cài đặt ADC cho C3
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_2, ADC_ATTEN_DB_11); 
+
+  // --- LOGIC LÕI KHI THỨC DẬY ---
+  
+  if (heThongDangBat) {
+    // 1. ĐO ĐỘ ỒN
+    float P_thuc_te = tinh_P_tho();
+    float P_now = (ALPHA * P_thuc_te) + ((1.0 - ALPHA) * P_cu);
+    P_cu = P_now; // Cập nhật "ký ức" RTC
+
+    // 2. KIỂM TRA NGƯỠNG (Ví dụ: 1000)
+    float P_NGUONG_CUC_BO = 1000.0;
+    
+    if (P_now > P_NGUONG_CUC_BO) {
+      // --- CHỈ BẬT WI-FI VÀ GỬI NẾU ỒN ---
+      WiFi.mode(WIFI_STA);
+      if (esp_now_init() == ESP_OK) {
+        esp_now_register_send_cb(OnDataSent);
+        
+        esp_now_peer_info_t peerInfo = {}; 
+        memcpy(peerInfo.peer_addr, masterAddress, 6);
+        peerInfo.channel = 0;
+        peerInfo.encrypt = false;
+        
+        if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+          myData.id = 1; // (Thay 1, 2, 3, 4)
+          myData.p_value = P_now;
+          esp_now_send(masterAddress, (uint8_t *) &myData, sizeof(myData));
+          delay(5); // Chờ 5ms để gửi xong
+        }
+        esp_now_deinit(); // Tắt ESP-NOW ngay lập tức
+      }
+    }
+  }
+  
+  // 3. "ĐÁNH LỪA" MH-CD42 (Tải giả)
+  // Kích một xung LOW (nhấn nút) vào chân Key trong 100ms
+  digitalWrite(KEY_PIN, LOW);
+  delay(100); 
+  digitalWrite(KEY_PIN, HIGH);
+  
+  // 4. ĐI NGỦ
+  // Ngủ 20 giây (ngắn hơn 30 giây của MH-CD42)
+  esp_sleep_enable_timer_wakeup(20 * 1000000); 
+  esp_deep_sleep_start();
+}
+
+// --- 7. HÀM LOOP (SẼ KHÔNG BAO GIỜ CHẠY) ---
+void loop() {
+  // Không có gì ở đây
+}
