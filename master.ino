@@ -8,14 +8,21 @@
 volatile float P_muot_values[4] = {0.0, 0.0, 0.0, 0.0};
 const int NUM_MICS=4;
 const float MIC_POSITIONS[NUM_MICS][2]={
-  {0.0,0.0},
-  {6.0,0.0},
-  {0.0,6.0},
-  {6.6,6.6},
+  {0.0,0.0}, // Mic 1 (Slave 1) mỗi ô trong lớp học là 1 đơn vị
+  {18.0,0.0}, // Mic 2 (Slave 2)
+  {0.0,12.0}, // Mic 3 (Slave 3)
+  {18.0,12.0}, // Mic 4 (Slave 4)
 };
 const int NUM_ZONES=8;
 const float ZONE_CENTERS[NUM_ZONES][2]={
-  {1.6,0.0}, // điền đầy đủ 8 khu vực vô cho tôi
+  {4.72, 5.0}, // Zone 1 (Như code gốc của bạn)
+  {4.72, 9.85}, // Zone 2 (Trên trục X, gần mic 1)
+  {8.5, 5.0}, // Zone 3 (Trên trục Y, giữa mic 0-2)
+  {8.5, 9.85}, // Zone 4 (Trên trục X=6, giữa mic 1-3)
+  {13.12, 5.0}, // Zone 5 (Trên trục Y=6, giữa mic 2-3)
+  {13.12, 9.85}, // Zone 6 (Tâm của các mic)
+  {17.95, 5.0}, // Zone 7 (Góc phần tư 2)
+  {17.95, 9.85}, // Zone 8 (Góc phần tư 4)
 };
 double tinh_khoang_cach(double vung_x, double vung_y, double mic_x, double mic_y){
   double delta_x=vung_x-mic_x;
@@ -68,6 +75,12 @@ void setup() {
 
 // --- HÀM LOOP ---
 void loop() {
+  // In 4 giá trị P_mượt ra Serial Monitor (Để kiểm tra)
+  Serial.printf("P1: %.0f | P2: %.0f | P3: %.0f | P4: %.0f \n",
+                P_muot_values[0],
+                P_muot_values[1],
+                P_muot_values[2],
+                P_muot_values[3]);
 float P_nguong=3600;
   // Giai đoạn 3 (IDW và NeoPixel) sẽ được thêm vào đây sau
   float P_est_zones[NUM_ZONES];
