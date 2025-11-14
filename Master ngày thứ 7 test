@@ -1,0 +1,330 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <cmath>
+#include <Adafruit_NeoPixel.h>
+#include "driver/i2s.h"
+// --- Cấu hình chân ---
+const int BUTTON_PIN = 12;
+// --- Cấu hình I2S ---
+#define I2S_WS 25
+#define I2S_SD 33
+#define I2S_SCK 26
+#define SAMPLE_RATE 16000
+#define SAMPLES 256
+//------Cấu hình NeoPixel
+
+// --- DẢI 1: 16 LED CHO 8 VÙNG ---
+#define LED_VUNG_PIN    23
+#define LED_VUNG_COUNT  16
+Adafruit_NeoPixel strip_Vung(LED_VUNG_COUNT, LED_VUNG_PIN, NEO_GRB + NEO_KHZ800);
+const int ZONE_TO_LED_MAP[NUM_ZONES][2] = {
+  // {LED_1, LED_2}
+  {0, 1},     // Vùng 0 (i=0) -> LED vật lý 0, 1
+  {2, 3},     // Vùng 1 (i=1) -> LED vật lý 2, 3
+  {7, 6},     // Vùng 2 (i=2) -> LED vật lý 7, 6 (do Zigzag)
+  {5, 4},     // Vùng 3 (i=3) -> LED vật lý 5, 4 (do Zigzag)
+  {8, 9},     // Vùng 4 (i=4) -> LED vật lý 8, 9
+  {10, 11},   // Vùng 5 (i=5) -> LED vật lý 10, 11
+  {15, 14},   // Vùng 6 (i=6) -> LED vật lý 15, 14 (do Zigzag)
+  {13, 12}    // Vùng 7 (i=7) -> LED vật lý 13, 12 (do Zigzag)
+};
+
+// --- DẢI 2: 1 LED BÁO MODE ---
+#define LED_MODE_PIN    18 // (Chân GPIO riêng)
+Adafruit_NeoPixel strip_Mode(1, LED_MODE_PIN, NEO_GRB + NEO_KHZ800);
+
+// --- DẢI 3: 1 LED BÁO ỒN TỔNG THỂ ---
+#define LED_TONG_PIN    19 // (Chân GPIO riêng)
+Adafruit_NeoPixel strip_Tong(1, LED_TONG_PIN, NEO_GRB + NEO_KHZ800);
+// const int SPEAKER_PIN = 13;
+//--Biến buffer
+int32_t buffer[SAMPLES];
+size_t bytesRead = 0;
+// --- Biến cho nút bấm & Trạng thái ---
+// volatile để báo cho trình biên dịch biết biến này có thể thay đổi trong ngắt
+volatile int count = 0; // 0=Tắt, 1=NeoPixel, 2=Loa
+volatile bool buttonPressed = false; // Cờ báo hiệu nút đã được bấm
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; // Bộ bảo vệ để tránh xung đột dữ liệu
+unsigned long lastDebounceTime = 0; // Thời gian cuối cùng bấm nút (để chống rung)
+unsigned long debounceDelay = 50;   // Thời gian chờ chống rung (50ms)
+
+// --- Mảng lưu giá trị P_mượt từ 4 Slaves ---
+volatile float P_muot_values[4] = {0.0, 0.0, 0.0, 0.0};
+const int NUM_MICS=4;
+const float MIC_POSITIONS[NUM_MICS][2]={
+  {0.0,0.0}, // Mic 1 (Slave 1) mỗi ô trong lớp học là 1 đơn vị
+  {18.0,0.0}, // Mic 2 (Slave 2)
+  {0.0,12.0}, // Mic 3 (Slave 3)
+  {18.0,12.0}, // Mic 4 (Slave 4)
+
+};
+
+// --- 8 Khu vực ước tính (IDW) ---
+const int NUM_ZONES=8;
+const float ZONE_CENTERS[NUM_ZONES][2]={
+  {4.72, 5.0}, // Zone 1 (Như code gốc của bạn)
+  {4.72, 9.85}, // Zone 2 (Trên trục X, gần mic 1)
+  {8.5, 5.0}, // Zone 3 (Trên trục Y, giữa mic 0-2)
+  {8.5, 9.85}, // Zone 4 (Trên trục X=6, giữa mic 1-3)
+  {13.12, 5.0}, // Zone 5 (Trên trục Y=6, giữa mic 2-3)
+  {13.12, 9.85}, // Zone 6 (Tâm của các mic)
+  {17.95, 5.0}, // Zone 7 (Góc phần tư 2)
+  {17.95, 9.85}, // Zone 8 (Góc phần tư 4)
+};
+
+// --- Hàm tính khoảng cách ---
+double tinh_khoang_cach(double vung_x, double vung_y, double mic_x, double mic_y){
+  double delta_x=vung_x-mic_x;
+  double delta_y=vung_y-mic_y;
+
+  double dinh_b=pow(delta_x,2)+pow(delta_y,2);
+  double distance=sqrt(dinh_b);
+  return distance;
+};
+
+// --- Hàm khởi tạo I2S (Giữ nguyên) ---
+void setupI2S() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false
+  };
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+// --- Hàm tính RMS (Giữ nguyên) ---
+// Note1: Ta tính bằng cách là trong khoảng tgian tần số lấy mẫu nó sẽ đi tìm bình phương của áp suất âm thanh đó rồi lấy căn trung bình áp suất
+//Note 2: Ta nên sử dụng đo mức áp suất âm thanh vì áp suất âm thanh là một đại lượng vô hướng để diễn tả sự thay đổi âm thanh trong không gian nên ta có thể dễ dang đo đạt được thông qua mic. 
+//Còn những hàm khác như cường độ âm thanh thì nó là đại lượng vector nên việc đo đạt sẽ vô cùng khó khăn và cần nhiều thiết bị chuyên dụng
+double calculateRMS(int32_t *data, int samples) {
+  double mean = 0;
+  for (int i = 0; i < samples; i++) mean += data[i];
+  mean /= samples;
+  double sum = 0;
+  for (int i = 0; i < samples; i++) {
+    double x = (data[i] - mean) / 2147483648.0; 
+sum += x * x;
+  }
+  return sqrt(sum / samples);
+}
+// --- Cấu trúc dữ liệu (PHẢI GIỐNG HỆT BÊN SLAVE) ---
+typedef struct struct_message {
+  int id;
+  float p_value;
+} struct_message;
+
+// --- HÀM NGẮT (ISR) CHO NÚT BẤM ---
+// IRAM_ATTR để lưu hàm này vào RAM cho tốc độ thực thi nhanh
+void IRAM_ATTR handleButtonInterrupt() {
+  // Chống rung cho nút bấm
+  if (millis() - lastDebounceTime > debounceDelay) {
+    portENTER_CRITICAL_ISR(&mux); // Khóa bộ nhớ
+    buttonPressed = true; // Đặt cờ báo
+    lastDebounceTime = millis();
+    portEXIT_CRITICAL_ISR(&mux); // Mở khóa
+  }
+}
+
+// --- HÀM CALLBACK KHI NHẬN DỮ LIỆU ---
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+  
+  struct_message myData;
+  memcpy(&myData, incomingData, sizeof(myData));
+
+  int slave_id = myData.id;
+  float p_value = myData.p_value;
+
+  // Cập nhật giá trị vào đúng mảng
+  if (slave_id >= 1 && slave_id <= 4) {
+    P_muot_values[slave_id - 1] = p_value;
+  }
+}
+
+// --- HÀM SETUP ---
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Day la MASTER. Dang lang nghe...");
+  setupI2S();
+  // Cấu hình chân
+  pinMode(BUTTON_PIN, INPUT_PULLUP); // Nút bấm dùng điện trở kéo lên nội bộ
+
+  // Gắn ngắt cho nút bấm, kích hoạt khi có cạnh XUỐNG (nhấn nút)
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, FALLING);
+
+  // Khởi tạo WiFi và ESP-NOW
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Loi khoi tao ESP-NOW");
+    return;
+  }
+  
+  // Đăng ký Hàm Callback Nhận Dữ liệu
+  esp_now_register_recv_cb(OnDataRecv);
+  Serial.println("Khoi dong hoan tat. Mode=0 (Idle).");
+ // --- KHỞI TẠO 3 DẢI LED ---
+  strip_Vung.begin();
+  strip_Vung.setBrightness(70); // 70% độ sáng
+  strip_Vung.clear(); 
+  
+  strip_Mode.begin();
+  strip_Mode.setBrightness(70);
+  strip_Mode.setPixelColor(0, strip_Mode.Color(100, 100, 100)); // Mode 0 = Trắng
+  
+  strip_Tong.begin();
+  strip_Tong.setBrightness(70);
+  strip_Tong.setPixelColor(0, strip_Tong.Color(0, 255, 0)); // Ồn Tổng = Xanh
+  
+  // Hiển thị trạng thái ban đầu
+  strip_Vung.show();
+  strip_Mode.show();
+  strip_Tong.show();
+}
+
+// --- HÀM LOOP ---
+void loop() {
+  
+  // 1. XỬ LÝ NÚT BẤM (NẾU CÓ)
+  if (buttonPressed) {
+    portENTER_CRITICAL(&mux); 
+    buttonPressed = false;    
+    portEXIT_CRITICAL(&mux); 
+
+    count++;
+    if (count > 2) { 
+      count = 0;
+    }
+    
+    // Xử lý logic KHI CHUYỂN MODE (Chỉ in ra và tắt)
+    if (count == 0) {
+      Serial.println("\n--- MODE 0: IDLE (Tat) ---");
+      // noTone(SPEAKER_PIN); // (Bạn đã bỏ loa)
+      strip_Vung.clear(); // Tắt dải Vùng
+      strip_Vung.show();
+      strip_Mode.setPixelColor(0, strip_Mode.Color(100, 100, 100)); // Mode = Trắng
+      strip_Mode.show();
+      strip_Tong.setPixelColor(0, strip_Tong.Color(0, 255, 0)); // Ồn Tổng = Xanh
+      strip_Tong.show();
+    } else if (count == 1) {
+      Serial.println("\n--- MODE 1: BINH THUONG ---");
+      // noTone(SPEAKER_PIN); 
+      strip_Mode.setPixelColor(0, strip_Mode.Color(0, 255, 0)); // Mode = Xanh Lá
+      strip_Mode.show();
+    } else { // count == 2
+      Serial.println("\n--- MODE 2: YEN TINH ---");
+      // noTone(SPEAKER_PIN);
+      strip_Mode.setPixelColor(0, strip_Mode.Color(255, 0, 0)); // Mode = Đỏ
+      strip_Mode.show();
+    }
+  } // --- Kết thúc xử lý nút bấm ---
+
+  
+  // 2. XỬ LÝ LOGIC CHÍNH (Dựa trên 'count' đã được cập nhật)
+
+  if (count == 0) {
+    // --- MODE 0: TẮT (IDLE) ---
+    // Không làm gì cả. (LED đã được tắt ở trên)
+    
+  } 
+  else { 
+    // --- MODE 1 & 2: HỆ THỐNG BẬT ---
+    
+    float P_est_zones[NUM_ZONES];
+    bool anyZoneNoisy = false; 
+
+    // Bắt đầu tính toán IDW (8 vùng)
+    for (int i = 0; i < NUM_ZONES; i++) {
+      float vung_x = ZONE_CENTERS[i][0];
+      float vung_y = ZONE_CENTERS[i][1];
+      double tong_trong_so = 0.0;
+      double tong_P_nhan_trong_so = 0.0;
+
+      // Vòng lặp 4 micro
+      for (int j = 0; j < NUM_MICS; j++) {
+        float mic_x = MIC_POSITIONS[j][0];
+        float mic_y = MIC_POSITIONS[j][1];
+        double d = tinh_khoang_cach(vung_x, vung_y, mic_x, mic_y);
+        double w = 0.0;
+        if (d > 0.001) { w = 1.0 / d; } else { w = 10000.0; }
+        tong_trong_so += w;
+        tong_P_nhan_trong_so += P_muot_values[j] * w;
+      }
+      P_est_zones[i] = tong_P_nhan_trong_so / tong_trong_so;
+    }
+    
+    // Đọc I2S (Đo dB Tổng thể)
+    i2s_read(I2S_NUM_0, &buffer, sizeof(buffer), &bytesRead, portMAX_DELAY);
+    double rms = calculateRMS(buffer, SAMPLES);
+    double raw_dB = 20 * log10(rms) + 94;
+    
+    Serial.printf("P1:%.0f|P2:%.0f|P3:%.0f|P4:%.0f || Tong dB: %.1f\n",
+                  P_muot_values[0], P_muot_values[1], P_muot_values[2], P_muot_values[3], raw_dB);
+
+    // 3. XỬ LÝ OUTPUT DỰA TRÊN MODE
+    float P_nguong_vung;
+    float dB_nguong_Vang; // Ngưỡng "hơi ồn"
+    float dB_nguong_Do;   // Ngưỡng "rất ồn"
+    if (count == 1) {
+      // --- MODE 1: BINH THUONG ---
+      dB_nguong_Vang = 65.0; 
+      dB_nguong_Do = 75.0;
+      P_nguong_vung = 3600;
+      if (raw_dB >= 65 && raw_dB <= 75) {
+        Serial.println("   -> LOP QUA ON (Mode 1)");
+      }
+      
+    } 
+    else { // count == 2
+      // --- MODE 2: YEN TINH ---
+      dB_nguong_Vang = 55.0; 
+      dB_nguong_Do = 65.0;
+      P_nguong_vung = 1800; 
+      if (raw_dB >= 55 && raw_dB <= 65) {
+         Serial.println("   -> LOP QUA ON (Mode 2)");
+      }
+    }
+
+    // --- HIỂN THỊ NEOPIXEL (Chạy cho cả Mode 1 và 2) ---
+    if (raw_dB > dB_nguong_Do) {
+      strip_Tong.setPixelColor(0, strip_Tong.Color(255, 0, 0)); // Đỏ
+    } else if (raw_dB > dB_nguong_Vang) {
+      strip_Tong.setPixelColor(0, strip_Tong.Color(255, 150, 0)); // Vàng
+    } else {
+      strip_Tong.setPixelColor(0, strip_Tong.Color(0, 255, 0)); // Xanh
+    }
+    strip_Tong.show();
+ // --- HIỂN THỊ NEOPIXEL (Chạy cho cả Mode 1 và 2) ---
+    for (int i = 0; i < 8; i++) { // Lặp 8 vùng (i = 0 đến 7)
+      
+     
+      // Lấy 2 chỉ số LED vật lý từ Mảng Ánh xạ
+      int led_index_1 = ZONE_TO_LED_MAP[i][0];   
+      int led_index_2 = ZONE_TO_LED_MAP[i][1];
+
+      if (P_est_zones[i] > P_nguong_vung) {
+        strip_Vung.setPixelColor(led_index_1, strip_Vung.Color(255, 0, 0)); // ĐỎ
+        strip_Vung.setPixelColor(led_index_2, strip_Vung.Color(255, 0, 0));
+      } else {
+        strip_Vung.setPixelColor(led_index_1, strip_Vung.Color(0, 255, 0)); // XANH
+        strip_Vung.setPixelColor(led_index_2, strip_Vung.Color(0, 255, 0));
+      }
+    }
+    strip_Vung.show(); // Cập nhật 16 LED 1 lần
+    
+  } // kết thúc if(count != 0)
+
+  delay(200); // Cập nhật 5 lần/giây
+}
