@@ -1,0 +1,129 @@
+/*
+ * CODE SLAVE (PHIÊN BẢN "LUÔN BẬT" - KHÔNG DEEP SLEEP)
+ * Nhiệm vụ: Tính P_mượt và gửi qua ESP-NOW (nếu Master cho phép).
+ */
+
+// --- 1. THÊM CÁC THƯ VIỆN CẦN THIẾT ---
+#include "driver/adc.h" // Cho ADC C3
+#include <esp_now.h>   // Cho ESP-NOW
+#include <WiFi.h>      // Cho ESP-NOW
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// --- 2. CẤU HÌNH CẢM BIẾN (Giống Giai đoạn 1) ---
+const int MIC_PIN = 2; // (Hoặc 3, 4... tùy bạn cắm chân nào)
+const int SAMPLE_WINDOWS = 50;
+const int ADC_MAX = 4095;
+const float ALPHA = 0.2; 
+float P_cu = 0.0;       
+
+// --- 3. BIẾN TRẠNG THÁI (volatile vì dùng trong Callback) ---
+volatile bool heThongDangBat = true; // Mặc định là Bật khi khởi động
+
+// --- 4. CẤU HÌNH ESP-NOW ---
+// THAY THẾ ĐỊA CHỈ MAC MASTER CỦA BẠN
+uint8_t masterAddress[] = {0xB8, 0xD6, 0x1A, 0xB8, 0x9F, 0x8C}; 
+
+// Cấu trúc dữ liệu GỬI (P_mượt)
+typedef struct struct_message {
+  int id;
+  float p_value;
+} struct_message;
+
+// Cấu trúc dữ liệu NHẬN (Lệnh Bật/Tắt)
+typedef struct struct_command {
+  int command; // 0 = Tắt, 1 = Bật
+} struct_command;
+
+struct_message myData; // Biến để gửi
+
+// --- 5. CÁC HÀM (CALLBACK & TÍNH P_THÔ) ---
+
+// Callback GỬI (Xác nhận đã gửi)
+void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  // (Bạn có thể bỏ trống hàm này nếu không cần Serial)
+  Serial.print("Trang thai gui P_muot: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Thanh Cong" : "That Bai");
+}
+
+// Callback NHẬN (Nhận lệnh Bật/Tắt từ Master)
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+  struct_command myCommand;
+  memcpy(&myCommand, incomingData, sizeof(myCommand));
+
+  if (myCommand.command == 0) {
+    heThongDangBat = false; // Master bảo Tắt
+  } else {
+    heThongDangBat = true;  // Master bảo Bật
+  }
+}
+
+// Hàm TÍNH P_THÔ (vẫn có yield() để chống WDT)
+float tinh_P_tho() {
+  unsigned long bat_dau = millis();
+  int sample_max = 0; int sample_min = ADC_MAX; int sample;
+  while (millis() < bat_dau + SAMPLE_WINDOWS) {
+    sample = adc1_get_raw(ADC1_CHANNEL_2); // Dùng hàm cấp thấp (Giả sử MIC_PIN = 2)
+    if (sample > sample_max) sample_max = sample;
+    if (sample < sample_min) sample_min = sample;
+    yield(); // Tránh Crash WDT
+  }
+  return (float)(sample_max - sample_min);
+}
+
+// --- 6. HÀM SETUP (Thiết lập ADC và ESP-NOW) ---
+void setup() {
+  // Tắt sụt áp (Rất quan trọng khi chạy pin)
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
+  
+  Serial.begin(115200);
+
+  // Cài đặt ADC cho C3
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_2, ADC_ATTEN_DB_11); 
+
+  // Cài đặt ESP-NOW (Giao tiếp 2 chiều)
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Loi khoi tao ESP-NOW");
+    return;
+  }
+  
+  // Đăng ký cả 2 callback
+  esp_now_register_recv_cb(OnDataRecv); // Để Lắng nghe Master
+  esp_now_register_send_cb(OnDataSent); // Để Xác nhận Gửi
+
+  // Đăng ký "bạn bè" (Master)
+  esp_now_peer_info_t peerInfo = {}; 
+  memcpy(peerInfo.peer_addr, masterAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Loi dang ky Master");
+    return;
+  }
+}
+
+// --- 7. HÀM LOOP (LOGIC CHÍNH NẰM Ở ĐÂY) ---
+void loop() {
+  
+  // CHỈ LÀM VIỆC NẾU MASTER CHO PHÉP (heThongDangBat == true)
+  if (heThongDangBat) {
+    
+    // Tính P_mượt
+    float P_thuc_te = tinh_P_tho();
+    float P_now = (ALPHA * P_thuc_te) + ((1.0 - ALPHA) * P_cu);
+    P_cu = P_now; // Cập nhật "ký ức"
+
+    // Gán dữ liệu (NHỚ THAY SỐ NÀY CHO TỪNG CON SLAVE)
+    myData.id = 1; // (Slave 1 là 1, Slave 2 là 2,...)
+    myData.p_value = P_now;
+
+    // Gửi dữ liệu
+    esp_now_send(masterAddress, (uint8_t *) &myData, sizeof(myData));
+  }
+  
+  // Delay 100ms (dù Bật hay Tắt) để WDT hoạt động
+  delay(100); 
+}
