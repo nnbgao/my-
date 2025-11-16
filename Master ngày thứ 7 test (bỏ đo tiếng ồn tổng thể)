@@ -15,8 +15,6 @@ Adafruit_NeoPixel strip_Mode(1, LED_MODE_PIN, NEO_GRB + NEO_KHZ800);
 // const int SPEAKER_PIN = 13;
 //---Gía trị tín hiệu
 volatile float P_muot_values[4] = {0.0, 0.0, 0.0, 0.0}; 
-float P_nen_vung = 500.0; // P nền (sẽ được học)
-
 // Ngưỡng Delta (Giá trị cộng thêm)
 const float DELTA_MODE_1 = 3000.0; // Ngưỡng "Bình thường"
 const float DELTA_MODE_2 = 1500.0; // Ngưỡng "Yên tĩnh"
@@ -140,19 +138,14 @@ void setup() {
   strip_Mode.setBrightness(70);
   strip_Mode.setPixelColor(0, strip_Mode.Color(100, 100, 100)); // Mode 0 = Trắng
   
-  strip_Tong.begin();
-  strip_Tong.setBrightness(70);
-  strip_Tong.setPixelColor(0, strip_Tong.Color(0, 255, 0)); // Ồn Tổng = Xanh
   
   // Hiển thị trạng thái ban đầu
   strip_Vung.show();
   strip_Mode.show();
-  strip_Tong.show();
 }
 
 // --- HÀM LOOP ---
 void loop() {
-float P_tong_the = (P_muot_values[0] + P_muot_values[1] + P_muot_values[2] + P_muot_values[3]) / 4.0;
   // 1. XỬ LÝ NÚT BẤM (NẾU CÓ)
   if (buttonPressed) {
     portENTER_CRITICAL(&mux); 
@@ -192,7 +185,6 @@ float P_tong_the = (P_muot_values[0] + P_muot_values[1] + P_muot_values[2] + P_m
   if (count == 0) {
     // --- MODE 0: TẮT (IDLE) ---
     // Không làm gì cả. (LED đã được tắt ở trên)
-    P_nen_vung = (0.05 * P_tong_the) + (0.95 * P_nen_vung);
   } 
   else { 
     // --- MODE 1 & 2: HỆ THỐNG BẬT ---
@@ -228,11 +220,11 @@ float P_tong_the = (P_muot_values[0] + P_muot_values[1] + P_muot_values[2] + P_m
     float P_nguong_vung;
     if (count == 1) {
       // --- MODE 1: BINH THUONG ---
-      P_nguong_vung= P_nen_vung+DELTA_MODE_1;
+      P_nguong_vung= DELTA_MODE_1;
       
     } 
     else { // count == 2
-     P_nguong_vung= P_nen_vung+DELTA_MODE_1;
+     P_nguong_vung= DELTA_MODE_2;
     }
 
     // --- HIỂN THỊ NEOPIXEL (Chạy cho cả Mode 1 và 2) ---
