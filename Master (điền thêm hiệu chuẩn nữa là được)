@@ -1,0 +1,175 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <cmath>
+#include <Adafruit_NeoPixel.h>
+// (Đã xóa I2S)
+
+// --- Cấu hình chân ---
+const int BUTTON_PIN = 12;
+
+// --- DẢI 1: 16 LED CHO 8 VÙNG ---
+#define LED_VUNG_PIN    23
+#define LED_VUNG_COUNT  16
+Adafruit_NeoPixel strip_Vung(LED_VUNG_COUNT, LED_VUNG_PIN, NEO_GRB + NEO_KHZ800);
+
+// --- DẢI 2: 1 LED BÁO MODE ---
+#define LED_MODE_PIN    18 
+Adafruit_NeoPixel strip_Mode(1, LED_MODE_PIN, NEO_GRB + NEO_KHZ800);
+
+// (Đã xóa Dải 3 LED_TONG_PIN)
+
+// --- GIÁ TRỊ TÍN HIỆU ---
+volatile float P_muot_values[4] = {0.0, 0.0, 0.0, 0.0}; 
+// (Đã xóa P_nen_vung và DELTA_MODE)
+
+// --- Ngưỡng CỐ ĐỊNH (Bạn tự Hiệu chuẩn) ---
+const float P_NGUONG_MODE_1 = 3600.0; // Ngưỡng "Bình thường"
+const float P_NGUONG_MODE_2 = 1500.0; // Ngưỡng "Yên tĩnh"
+
+// --- Biến cho nút bấm & Trạng thái ---
+volatile int count = 0; // 0=Tắt, 1=Bình thường, 2=Yên tĩnh
+// ... (Các biến volatile khác của bạn) ...
+volatile bool buttonPressed = false; 
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; 
+unsigned long lastDebounceTime = 0; 
+unsigned long debounceDelay = 50;   
+
+// --- Mảng Hiệu chuẩn & Tọa độ ---
+const float CALIBRATION_FACTORS[4] = { 1.0, 1.0, 1.0, 1.0 }; // (Điền 4 hệ số của bạn)
+const int NUM_MICS = 4;
+const float MIC_POSITIONS[NUM_MICS][2]={{0.0,0.0},{18.0,0.0},{0.0,12.0},{18.0,12.0},};
+const int NUM_ZONES = 8;
+const float ZONE_CENTERS[NUM_ZONES][2]={{4.72, 5.0},{4.72, 9.85},{8.5, 5.0},{8.5, 9.85},{13.12, 5.0},{13.12, 9.85},{17.95, 5.0},{17.95, 9.85},};
+const int ZONE_TO_LED_MAP[NUM_ZONES][2] = {{8,15},{0,7},{9,14},{6,1},{13,10},{5,2},{11,12},{3,4}};
+
+// --- Hàm tính khoảng cách (Giữ nguyên) ---
+double tinh_khoang_cach(double vung_x, double vung_y, double mic_x, double mic_y){
+  double delta_x=vung_x-mic_x; double delta_y=vung_y-mic_y;
+  double dinh_b=pow(delta_x,2)+pow(delta_y,2);
+  double distance=sqrt(dinh_b);
+  return distance;
+};
+
+// --- Cấu trúc dữ liệu (Giữ nguyên) ---
+typedef struct struct_message { int id; float p_value; } struct_message;
+
+// --- HÀM NGẮT (ISR) CHO NÚT BẤM (Giữ nguyên) ---
+void IRAM_ATTR handleButtonInterrupt() {
+  if (millis() - lastDebounceTime > debounceDelay) {
+    portENTER_CRITICAL_ISR(&mux); buttonPressed = true; lastDebounceTime = millis(); portEXIT_CRITICAL_ISR(&mux);
+  }
+}
+
+// --- HÀM CALLBACK KHI NHẬN DỮ LIỆU (Đã Hiệu chuẩn) ---
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+  struct_message myData;
+  memcpy(&myData, incomingData, sizeof(myData));
+  int slave_id = myData.id;
+  float p_value_tho = myData.p_value; 
+  if (slave_id >= 1 && slave_id <= 4) {
+    int index = slave_id - 1;
+    P_muot_values[index] = p_value_tho * CALIBRATION_FACTORS[index]; // Áp dụng Hiệu chuẩn
+  }
+}
+
+// --- HÀM SETUP (Đã Dọn dẹp) ---
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Day la MASTER (Static Threshold). Dang lang nghe...");
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP); 
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, FALLING);
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Loi khoi tao ESP-NOW");
+    return;
+  }
+  
+  esp_now_register_recv_cb(OnDataRecv);
+  Serial.println("Khoi dong hoan tat. Mode=0 (Idle).");
+  
+  // --- KHỞI TẠO 2 DẢI LED ---
+  strip_Vung.begin(); strip_Vung.setBrightness(70); strip_Vung.clear(); 
+  strip_Mode.begin(); strip_Mode.setBrightness(70); strip_Mode.setPixelColor(0, strip_Mode.Color(100, 100, 100)); 
+  strip_Vung.show(); strip_Mode.show();
+}
+
+// --- HÀM LOOP (Đã Dọn dẹp) ---
+void loop() {
+  
+  // 1. XỬ LÝ NÚT BẤM
+  if (buttonPressed) {
+    portENTER_CRITICAL(&mux); 
+    buttonPressed = false;    
+    portEXIT_CRITICAL(&mux); 
+
+    count++;
+    if (count > 2) { count = 0; }
+    
+    if (count == 0) { // Tắt
+      Serial.println("\n--- MODE 0: IDLE (Tat) ---");
+      strip_Vung.clear(); strip_Vung.show();
+      strip_Mode.setPixelColor(0, strip_Mode.Color(100, 100, 100)); strip_Mode.show();
+    } else if (count == 1) { // Mode 1
+      Serial.println("\n--- MODE 1: BINH THUONG ---");
+      strip_Mode.setPixelColor(0, strip_Mode.Color(0, 255, 0)); strip_Mode.show();
+    } else { // count == 2
+      Serial.println("\n--- MODE 2: YEN TINH ---");
+      strip_Mode.setPixelColor(0, strip_Mode.Color(255, 0, 0)); strip_Mode.show();
+    }
+  } 
+
+  // 2. XỬ LÝ LOGIC CHÍNH (Dựa trên 'count')
+  if (count == 0) {
+    // --- MODE 0: TẮT (IDLE) ---
+    // Không làm gì cả. (Không "Học" nữa)
+  } 
+  else { 
+    // --- MODE 1 & 2: HỆ THỐNG BẬT ---
+    
+    // Tính IDW 8 vùng
+    float P_est_zones[NUM_ZONES];
+    for (int i = 0; i < NUM_ZONES; i++) {
+      float vung_x = ZONE_CENTERS[i][0]; float vung_y = ZONE_CENTERS[i][1]; double tong_trong_so = 0.0; double tong_P_nhan_trong_so = 0.0;
+      for (int j = 0; j < NUM_MICS; j++) {
+        float mic_x = MIC_POSITIONS[j][0]; float mic_y = MIC_POSITIONS[j][1]; double d = tinh_khoang_cach(vung_x, vung_y, mic_x, mic_y); double w = 0.0;
+        if (d > 0.001) { w = 1.0 / d; } else { w = 10000.0; }
+        tong_trong_so += w;
+        tong_P_nhan_trong_so += P_muot_values[j] * w;
+      }
+      P_est_zones[i] = tong_P_nhan_trong_so / tong_trong_so;
+    }
+    
+    // (In debug)
+    Serial.printf("P1:%.0f|P2:%.0f|P3:%.0f|P4:%.0f\n",
+                  P_muot_values[0], P_muot_values[1], P_muot_values[2], P_muot_values[3]);
+
+    // 3. XỬ LÝ OUTPUT DỰA TRÊN MODE
+    float P_nguong_vung_hien_tai; // Ngưỡng CỐ ĐỊNH cho mode này
+
+    if (count == 1) { // Mode 1
+      P_nguong_vung_hien_tai = P_NGUONG_MODE_1; // (ví dụ: 3600)
+    } else { // count == 2
+      P_nguong_vung_hien_tai = P_NGUONG_MODE_2; // (ví dụ: 1500)
+    }
+
+    // --- HIỂN THỊ LED VÙNG (Dải 1) ---
+    for (int i = 0; i < 8; i++) { 
+      int led_index_1 = ZONE_TO_LED_MAP[i][0];   
+      int led_index_2 = ZONE_TO_LED_MAP[i][1]; 
+
+      if (P_est_zones[i] > P_nguong_vung_hien_tai) {
+        strip_Vung.setPixelColor(led_index_1, strip_Vung.Color(255, 0, 0)); // ĐỎ
+        strip_Vung.setPixelColor(led_index_2, strip_Vung.Color(255, 0, 0));
+      } else {
+        strip_Vung.setPixelColor(led_index_1, strip_Vung.Color(0, 255, 0)); // XANH
+        strip_Vung.setPixelColor(led_index_2, strip_Vung.Color(0, 255, 0));
+      }
+    }
+    strip_Vung.show();
+    
+  } // kết thúc if(count != 0)
+
+  delay(200); 
+}
