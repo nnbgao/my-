@@ -1,0 +1,113 @@
+/*
+ * CODE MASTER (PHIÊN BẢN TEST HIỆU CHUẨN 5 GIÂY)
+ * Nhiệm vụ: Lắng nghe 4 Slave, tính trung bình (SMA)
+ * giá trị P_mượt của từng Slave mỗi 5 giây và in ra.
+ */
+
+#include <esp_now.h>
+#include <WiFi.h>
+
+// --- CẤU HÌNH SMA 5 GIÂY ---
+// Biến "volatile" vì chúng được ghi trong ngắt (Callback)
+// và được đọc trong loop()
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+// Mảng 4 phần tử để LƯU TỔNG (Sum)
+volatile double P_tong_5s[4] = {0.0, 0.0, 0.0, 0.0};
+// Mảng 4 phần tử để ĐẾM SỐ LƯỢNG MẪU (Count)
+volatile int so_luong_mau_5s[4] = {0, 0, 0, 0};
+
+// Biến hẹn giờ 5 giây (5000 ms)
+unsigned long thoi_diem_bat_dau_chu_ky = 0;
+const int CHU_KY_DO = 5000; 
+
+// Cấu trúc dữ liệu (PHẢI GIỐNG HỆT BÊN SLAVE)
+typedef struct struct_message {
+  int id;
+  float p_value;
+} struct_message;
+
+
+// --- HÀM CALLBACK KHI NHẬN DỮ LIỆU ---
+// (Sẽ tự động chạy khi nhận được tin nhắn)
+// (SỬA LỖI LOGIC: Cập nhật vào mảng TỔNG và ĐẾM)
+void OnDataRecv(const esp_now_recv_info * info, const uint8_t *incomingData, int len) {
+  
+  struct_message myData;
+  memcpy(&myData, incomingData, sizeof(myData)); // Giải nén dữ liệu
+
+  int slave_id = myData.id;
+  float p_value = myData.p_value;
+
+  if (slave_id >= 1 && slave_id <= 4) {
+    int index = slave_id - 1; // (id 1 -> index 0)
+    
+    // --- LOGIC MỚI: Cộng dồn vào bộ đếm 5 giây ---
+    P_tong_5s[index] += p_value;      // Cộng P_mượt vào Tổng
+    so_luong_mau_5s[index]++;         // Đếm +1
+  }
+}
+
+// --- HÀM SETUP ---
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Day la MASTER (Ban Hieu Chuan 5s). Dang lang nghe...");
+  
+  WiFi.mode(WIFI_STA);
+
+  // Khởi tạo ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Loi khoi tao ESP-NOW");
+    return;
+  }
+  
+  // Đăng ký Hàm Callback Nhận Dữ liệu
+  esp_now_register_recv_cb(OnDataRecv);
+  
+  // Đặt mốc thời gian ban đầu
+  thoi_diem_bat_dau_chu_ky = millis();
+}
+
+// --- HÀM LOOP (LOGIC MỚI: TÍNH SMA 5 GIÂY) ---
+void loop() {
+  
+  // 1. Kiểm tra xem đã đủ 5 giây chưa
+  if (millis() - thoi_diem_bat_dau_chu_ky >= CHU_KY_DO) {
+    
+    Serial.println("----------------------------------------------");
+    Serial.println("KET QUA TRUNG BINH 5 GIÂY (SMA):");
+    
+    // Mảng tạm để lưu 4 giá trị trung bình
+    float P_trung_binh_5s[4];
+
+    // 2. Lặp qua 4 slave để tính trung bình
+    for (int i = 0; i < 4; i++) {
+      
+      // Kiểm tra để tránh lỗi chia cho 0 (nếu Slave i không gửi gì)
+      if (so_luong_mau_5s[i] > 0) { 
+        P_trung_binh_5s[i] = P_tong_5s[i] / so_luong_mau_5s[i];
+      } else {
+        P_trung_binh_5s[i] = 0; // Không nhận được dữ liệu từ Slave này
+      }
+    }
+
+    // 3. In kết quả 4 giá trị SMA (đã ổn định)
+    Serial.printf("P1_SMA: %.0f | P2_SMA: %.0f | P3_SMA: %.0f | P4_SMA: %.0f \n",
+                  P_trung_binh_5s[0],
+                  P_trung_binh_5s[1],
+                  P_trung_binh_5s[2],
+                  P_trung_binh_5s[3]);
+
+    // 4. Đặt lại (Reset) bộ đếm cho chu kỳ 5 giây tiếp theo
+    portENTER_CRITICAL(&mux); // (Bạn nên thêm mux nếu dùng ESP32 lõi kép)
+    for (int i = 0; i < 4; i++) {
+        P_tong_5s[i] = 0.0;
+        so_luong_mau_5s[i] = 0;
+    }
+    portEXIT_CRITICAL(&mux);
+    
+    thoi_diem_bat_dau_chu_ky = millis(); // Reset đồng hồ
+  }
+  
+  // Không delay() trong loop()
+  // để đảm bảo Master luôn sẵn sàng nhận dữ liệu từ Callback
+}
