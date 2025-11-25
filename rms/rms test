@@ -1,0 +1,75 @@
+// --- CẤU HÌNH ---
+const int micPin = 3; // Kiểm tra lại chân GPIO trên ESP32-C3 Super Mini của bạn
+const int sampleWindow = 50; // Cửa sổ lấy mẫu 50ms (20Hz)
+
+// Hệ số chuyển đổi RMS (Dựa trên sóng SIN chuẩn)
+// Bạn có thể chỉnh số này: Tăng lên nếu thấy dB thấp, Giảm đi nếu thấy dB cao
+const float conversionFactor = 0.3535; 
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Tăng độ phân giải lên cao nhất (12-bit: 0-4095) để đo chính xác
+  analogReadResolution(12);
+  
+  // Có thể thêm dòng này để giảm nhiễu nếu cần (tùy mạch)
+  // analogSetPinAttenuation(micPin, ADC_6db); 
+  
+  Serial.println("Bat dau do...");
+}
+
+void loop() {
+  unsigned long startMillis = millis(); 
+  unsigned int signalMax = 0;
+  unsigned int signalMin = 4095;
+
+  // --- BƯỚC 1: LẤY MẪU (PEAK TO PEAK) ---
+  // Chạy vòng lặp này trong đúng 50ms
+  while (millis() - startMillis < sampleWindow) {
+    int sample = analogRead(micPin);
+    
+    // Loại bỏ các giá trị nhiễu vô lý (Spurious readings)
+    if (sample < 4095 && sample > 0) {
+      if (sample > signalMax) {
+        signalMax = sample; // Tìm đỉnh sóng
+      }
+      else if (sample < signalMin) {
+        signalMin = sample; // Tìm đáy sóng
+      }
+    }
+  }
+
+  // --- BƯỚC 2: TÍNH TOÁN ---
+  // Tính biên độ đỉnh-đỉnh (Raw Value)
+  int peakToPeak = signalMax - signalMin; 
+
+  // Chuyển đổi từ giá trị thô (0-4095) sang Điện áp (Volt)
+  // ESP32 dùng nguồn 3.3V
+  double volts = (peakToPeak * 3.3) / 4095.0; 
+
+  // Tính RMS dựa trên công thức quy đổi nhanh (Nhẹ hơn tính căn bậc 2 thực tế)
+  double rms = volts * conversionFactor;
+
+  // --- BƯỚC 3: TÍNH dB (Ước lượng) ---
+  // 20 * log10(V_rms / V_reference)
+  // V_ref là ngưỡng nghe thấy (thường là rất nhỏ). 
+  // Ở đây mình chọn 0.00631V (tương đương chuẩn tham chiếu phổ biến cho mic rời)
+  // Bạn có thể thay đổi số 0.00631 này để Calibrate (Hiệu chỉnh) cho khớp với máy đo
+  double db = 20 * log10(rms / 0.00631); 
+  
+  // Xử lý trường hợp im lặng tuyệt đối (tránh log(0) bị lỗi hoặc ra số âm vô cực)
+  if (db < 0) db = 0;
+
+  // --- BƯỚC 4: HIỂN THỊ (Serial Plotter) ---
+  // In theo định dạng này để Serial Plotter vẽ biểu đồ đẹp
+  Serial.print("Min:0,");  
+  Serial.print("Max:100,"); // Cố định khung biểu đồ dB (0-100dB)
+  Serial.print("PeakToPeak_Raw:");
+  Serial.print(peakToPeak / 10); // Chia nhỏ để vẽ chung biểu đồ cho dễ nhìn
+  Serial.print(",");
+  Serial.print("RMS_Volt:");
+  Serial.print(rms * 10); // Nhân lên để dễ nhìn đường sóng
+  Serial.print(",");
+  Serial.print("Decibel:");
+  Serial.println(db);
+}
