@@ -667,12 +667,33 @@ void loop() {
     // MODE 1 hoặc 2: Tính toán và hiển thị LED
     
     // === TÍNH IDW CHO CÁC VÙNG ===
-    for (int i = 0; i < NUM_ZONES; i++) {
-      float vung_x = ZONE_CENTERS[i][0];
-      float vung_y = ZONE_CENTERS[i][1];
-      double tong_trong_so = 0.0;
-      double tong_P_nhan_trong_so = 0.0;
-      int mic_co_tin_hieu = 0;
+for (int i = 0; i < NUM_ZONES; i++) {
+  float vung_x = ZONE_CENTERS[i][0];
+  float vung_y = ZONE_CENTERS[i][1];
+  
+  // Tìm mic có (giá_trị / khoảng_cách) lớn nhất
+  float max_influence = 0.0;
+  
+  for (int j = 0; j < NUM_MICS; j++) {
+    if (P_muot_values[j] < P_NGUONG_MIC_MIN) continue;
+    
+    float mic_x = MIC_POSITIONS[j][0];
+    float mic_y = MIC_POSITIONS[j][1];
+    double d = tinh_khoang_cach(vung_x, vung_y, mic_x, mic_y);
+    
+    // Influence = giá trị / (khoảng cách ^ 2)
+    float influence = (d > 0.001) ? (P_muot_values[j] / (d * d)) : (P_muot_values[j] * 10000.0);
+    
+    if (influence > max_influence) {
+      max_influence = influence;
+      P_est_zones[i] = P_muot_values[j]; // Lấy giá trị của mic có ảnh hưởng lớn nhất
+    }
+  }
+  
+  if (max_influence == 0.0) {
+    P_est_zones[i] = 0.0;
+  }
+}
       
       for (int j = 0; j < NUM_MICS; j++) {
         // Chỉ tính với mic có tín hiệu trên ngưỡng min
