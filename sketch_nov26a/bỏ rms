@@ -18,17 +18,23 @@ Adafruit_NeoPixel strip_Mode(1, LED_MODE_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel stripDB_Mode(1, LED_DB_PIN, NEO_GRB + NEO_KHZ800);
 
 // --- GIÁ TRỊ TÍN HIỆU ---
-volatile float P_muot_values[4] = {0.0, 0.0, 0.0, 0.0}; 
+float P_muot_values[4] = {0.0, 0.0, 0.0, 0.0}; 
 unsigned long last_receive_time[4] = {0, 0, 0, 0};
 
-// --- dB ---
+// --- RMS và dB ---
+#define RMS_WINDOW_SIZE 10
+#define MIN_FILTER_SIZE 5
+
+float rms_buffer[4][RMS_WINDOW_SIZE];
+int rms_index[4] = {0, 0, 0, 0};
+bool rms_buffer_filled[4] = {false, false, false, false};
+
+float rms_values[4] = {0.0, 0.0, 0.0, 0.0};
 float db_values[4] = {0.0, 0.0, 0.0, 0.0};
 
 // Baseline tracking
 float short_term_baseline[4] = {0.0, 0.0, 0.0, 0.0};
 float long_term_baseline[4] = {0.0, 0.0, 0.0, 0.0};
-
-#define MIN_FILTER_SIZE 5
 float min_filter_buffer[4][MIN_FILTER_SIZE];
 int min_filter_index[4] = {0, 0, 0, 0};
 bool min_filter_filled[4] = {false, false, false, false};
@@ -42,6 +48,7 @@ const float BASELINE_DECREASE_RATE = 0.03;
 const unsigned long BASELINE_UPDATE_INTERVAL = 100;
 const unsigned long EVENT_FREEZE_TIME = 4000;
 const float EVENT_THRESHOLD_RATIO = 1.2;
+const float REFERENCE_PRESSURE = 0.00002;
 
 // --- Ngưỡng ---
 float P_NGUONG_MODE_1 = 500.0;
@@ -118,15 +125,15 @@ void updateBaseline(int mic_index) {
   }
   last_baseline_update[mic_index] = current_time;
   
-  float current_value = P_muot_values[mic_index];
-  if (current_value < 0.0001) return;
+  float current_rms = rms_values[mic_index];
+  if (current_rms < 0.0001) return;
   
   // === MIN FILTER ===
-  min_filter_buffer[mic_index][min_filter_index[mic_index]] = current_value;
+  min_filter_buffer[mic_index][min_filter_index[mic_index]] = current_rms;
   min_filter_index[mic_index] = (min_filter_index[mic_index] + 1) % MIN_FILTER_SIZE;
   if (min_filter_index[mic_index] == 0) min_filter_filled[mic_index] = true;
   
-  float min_value = current_value;
+  float min_value = current_rms;
   int count_min = min_filter_filled[mic_index] ? MIN_FILTER_SIZE : min_filter_index[mic_index];
   
   if (count_min > 0) {
@@ -141,7 +148,7 @@ void updateBaseline(int mic_index) {
   
   // === PHÁT HIỆN EVENT ===
   if (long_term_baseline[mic_index] > 0 && 
-      current_value > long_term_baseline[mic_index] * EVENT_THRESHOLD_RATIO) {
+      current_rms > long_term_baseline[mic_index] * EVENT_THRESHOLD_RATIO) {
     if (!in_event[mic_index]) {
       in_event[mic_index] = true;
       event_start_time[mic_index] = current_time;
@@ -158,17 +165,17 @@ void updateBaseline(int mic_index) {
   // === KHỞI TẠO BASELINE ===
   if (long_term_baseline[mic_index] == 0.0) {
     long_term_baseline[mic_index] = min_value;
-    short_term_baseline[mic_index] = current_value;
+    short_term_baseline[mic_index] = current_rms;
     return;
   }
   
   // === CẬP NHẬT SHORT-TERM BASELINE ===
-  if (current_value < short_term_baseline[mic_index]) {
+  if (current_rms < short_term_baseline[mic_index]) {
     short_term_baseline[mic_index] = short_term_baseline[mic_index] * (1.0 - BASELINE_DECREASE_RATE) + 
-                                     current_value * BASELINE_DECREASE_RATE;
+                                     current_rms * BASELINE_DECREASE_RATE;
   } else {
     short_term_baseline[mic_index] = short_term_baseline[mic_index] * (1.0 - BASELINE_INCREASE_RATE) + 
-                                     current_value * BASELINE_INCREASE_RATE;
+                                     current_rms * BASELINE_INCREASE_RATE;
   }
   
   // === CẬP NHẬT LONG-TERM BASELINE ===
@@ -191,8 +198,24 @@ void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int 
     int index = slave_id - 1;
     float calibrated_value = p_value_tho * CALIBRATION_FACTORS[index];
     
+    // === TÍNH RMS ===
+    rms_buffer[index][rms_index[index]] = calibrated_value * calibrated_value;
+    rms_index[index] = (rms_index[index] + 1) % RMS_WINDOW_SIZE;
+    if (rms_index[index] == 0) rms_buffer_filled[index] = true;
+    
+    float sum = 0;
+    int count_samples = rms_buffer_filled[index] ? RMS_WINDOW_SIZE : rms_index[index];
+    float temp_rms = 0.0;
+    
+    if (count_samples > 0) {
+      for (int i = 0; i < count_samples; i++) {
+        sum += rms_buffer[index][i];
+      }
+      temp_rms = sqrt(sum / count_samples);
+    }
+    
     // === TÍNH dB ===
-    float V_pp = calibrated_value * (3.3 / 4095.0);
+    float V_pp = temp_rms * (3.3 / 4095.0);
     float V_rms = V_pp * 0.3535;
     if (V_rms < 0.00001) V_rms = 0.00001;
     float temp_db = 20 * log10(V_rms) + 80.65;
@@ -200,11 +223,11 @@ void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int 
     // === CẬP NHẬT VỚI CRITICAL SECTION ===
     portENTER_CRITICAL(&dataMux);
     P_muot_values[index] = calibrated_value;
+    rms_values[index] = temp_rms;
     db_values[index] = temp_db;
     last_receive_time[index] = millis();
     portEXIT_CRITICAL(&dataMux);
     
-    // Cập nhật baseline
     updateBaseline(index);
   }
 }
@@ -236,9 +259,11 @@ void handleRoot() {
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { 
       font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: 
-        repeating-conic-gradient(#fffdfa 0% 25%, #355a3c 0% 50%) 
-        50% / 40px 40px;
+      background-image: 
+        linear-gradient(0deg, transparent 24%, rgba(129,199,132,0.4) 25%, rgba(129,199,132,0.4) 26%, transparent 27%, transparent 74%, rgba(129,199,132,0.4) 75%, rgba(129,199,132,0.4) 76%, transparent 77%, transparent),
+        linear-gradient(90deg, transparent 24%, rgba(129,199,132,0.4) 25%, rgba(129,199,132,0.4) 26%, transparent 27%, transparent 74%, rgba(129,199,132,0.4) 75%, rgba(129,199,132,0.4) 76%, transparent 77%, transparent);
+      background-size: 80px 80px;
+      background-color: #f1f8e9;
       color: #1a1a1a;
       padding: 20px;
       min-height: 100vh;
@@ -248,36 +273,38 @@ void handleRoot() {
       text-align: center; 
       margin-bottom: 30px; 
       font-size: 2.5em; 
-      color: #355a3c;
-      text-shadow: 2px 2px 4px rgba(255,253,250,0.8);
-      background: rgba(255,253,250,0.95);
+      color: #558b2f;
+      text-shadow: 2px 2px 4px rgba(129,199,132,0.3);
+      background: rgba(241,248,233,0.95);
       padding: 20px;
       border-radius: 15px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+      box-shadow: 0 4px 16px rgba(129,199,132,0.3);
+      border: 2px solid #81c784;
     }
     .card { 
-      background: rgba(255,253,250,0.95);
+      background: rgba(241,248,233,0.95);
       backdrop-filter: blur(10px);
       border-radius: 15px;
       padding: 20px;
       margin-bottom: 20px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.2);
-      border: 2px solid #355a3c;
+      box-shadow: 0 4px 16px rgba(129,199,132,0.3);
+      border: 2px solid #81c784;
     }
     h2 {
-      color: #355a3c;
+      color: #558b2f;
       margin-bottom: 15px;
-      border-bottom: 2px solid #355a3c;
+      border-bottom: 2px solid #81c784;
       padding-bottom: 10px;
+      font-weight: 600;
     }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 15px; }
     .sensor-box {
-      background: linear-gradient(135deg, #355a3c 0%, #4a7a54 100%);
-      color: #fffdfa;
+      background: linear-gradient(135deg, #66bb6a 0%, #81c784 100%);
+      color: #fff;
       padding: 15px;
       border-radius: 10px;
       text-align: center;
-      box-shadow: 0 4px 12px rgba(53,90,60,0.3);
+      box-shadow: 0 4px 12px rgba(129,199,132,0.3);
     }
     .sensor-value {
       font-size: 2em;
@@ -298,27 +325,27 @@ void handleRoot() {
     }
     .btn {
       padding: 12px 30px;
-      border: 2px solid #355a3c;
+      border: 2px solid #81c784;
       border-radius: 8px;
       font-size: 1em;
       cursor: pointer;
       transition: all 0.3s;
       font-weight: bold;
-      background: #fffdfa;
-      color: #355a3c;
+      background: #f1f8e9;
+      color: #558b2f;
     }
     .btn-mode0 { background: #95a5a6; color: white; border-color: #7f8c8d; }
     .btn-mode1 { background: #27ae60; color: white; border-color: #229954; }
     .btn-mode2 { background: #e74c3c; color: white; border-color: #c0392b; }
-    .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(53,90,60,0.4); }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(129,199,132,0.4); }
     .btn:active { transform: translateY(0); }
     input[type="number"] {
       padding: 8px;
       border-radius: 5px;
-      border: 2px solid #355a3c;
+      border: 2px solid #81c784;
       width: 100px;
       font-size: 1em;
-      background: #fffdfa;
+      background: #f1f8e9;
     }
     .setting-row {
       display: flex;
@@ -326,19 +353,19 @@ void handleRoot() {
       align-items: center;
       margin: 10px 0;
       padding: 10px;
-      background: rgba(53,90,60,0.1);
+      background: rgba(129,199,132,0.1);
       border-radius: 8px;
-      border: 1px solid #355a3c;
+      border: 1px solid #81c784;
     }
     .status { 
       font-size: 1.5em; 
       text-align: center; 
       padding: 15px;
-      background: linear-gradient(135deg, #355a3c 0%, #4a7a54 100%);
-      color: #fffdfa;
+      background: linear-gradient(135deg, #66bb6a 0%, #81c784 100%);
+      color: #fff;
       border-radius: 10px;
       margin-bottom: 20px;
-      box-shadow: 0 4px 12px rgba(53,90,60,0.3);
+      box-shadow: 0 4px 12px rgba(129,199,132,0.3);
     }
     .baseline-info {
       font-size: 0.75em;
@@ -358,34 +385,38 @@ void handleRoot() {
 </head>
 <body>
   <div class="container">
-    <h1>📊 Noise Monitor Dashboard</h1>
+    <h1>📊 Noise Monitor Dashboard (RMS & dB)</h1>
     
     <div class="status" id="status">Đang tải...</div>
     
     <div class="card">
-      <h2>🎤 Giá trị Microphone (Real-time & dB)</h2>
+      <h2>🎤 Giá trị Microphone (Real-time RMS & dB)</h2>
       <div class="grid">
         <div class="sensor-box">
           <div>Mic 1 <span class="event-indicator" id="event1"></span></div>
           <div class="sensor-value" id="mic1">0</div>
+          <div class="sensor-detail">RMS: <span id="rms1">0</span></div>
           <div class="sensor-detail">dB: <span id="db1">0</span> dB</div>
           <div class="baseline-info">Baseline - ST: <span id="st1">0</span> | LT: <span id="lt1">0</span></div>
         </div>
         <div class="sensor-box">
           <div>Mic 2 <span class="event-indicator" id="event2"></span></div>
           <div class="sensor-value" id="mic2">0</div>
+          <div class="sensor-detail">RMS: <span id="rms2">0</span></div>
           <div class="sensor-detail">dB: <span id="db2">0</span> dB</div>
           <div class="baseline-info">Baseline - ST: <span id="st2">0</span> | LT: <span id="lt2">0</span></div>
         </div>
         <div class="sensor-box">
           <div>Mic 3 <span class="event-indicator" id="event3"></span></div>
           <div class="sensor-value" id="mic3">0</div>
+          <div class="sensor-detail">RMS: <span id="rms3">0</span></div>
           <div class="sensor-detail">dB: <span id="db3">0</span> dB</div>
           <div class="baseline-info">Baseline - ST: <span id="st3">0</span> | LT: <span id="lt3">0</span></div>
         </div>
         <div class="sensor-box">
           <div>Mic 4 <span class="event-indicator" id="event4"></span></div>
           <div class="sensor-value" id="mic4">0</div>
+          <div class="sensor-detail">RMS: <span id="rms4">0</span></div>
           <div class="sensor-detail">dB: <span id="db4">0</span> dB</div>
           <div class="baseline-info">Baseline - ST: <span id="st4">0</span> | LT: <span id="lt4">0</span></div>
         </div>
@@ -453,7 +484,7 @@ void handleRoot() {
       <h2>ℹ️ Thông tin Baseline</h2>
       <p style="margin: 10px 0;">ST = Short-term baseline (phản ứng nhanh)</p>
       <p style="margin: 10px 0;">LT = Long-term baseline (ổn định, sử dụng min filter)</p>
-      <p style="margin: 10px 0;">🔴 = Event đang xảy ra (Giá trị > 120% baseline)</p>
+      <p style="margin: 10px 0;">🔴 = Event đang xảy ra (RMS > 120% baseline)</p>
       <p style="margin: 10px 0;">🟢 = Không có event</p>
       <p style="margin: 10px 0;">Baseline tăng chậm (0.02%/lần), giảm nhanh (3%/lần)</p>
       <p style="margin: 10px 0;">Freeze baseline trong 4 giây đầu khi có event liên tục</p>
@@ -467,12 +498,13 @@ void handleRoot() {
         .then(data => {
           for (let i = 0; i < 4; i++) {
             document.getElementById('mic' + (i+1)).textContent = data.mic[i].toFixed(0);
+            document.getElementById('rms' + (i+1)).textContent = data.rms[i].toFixed(2);
             document.getElementById('db' + (i+1)).textContent = data.db[i].toFixed(1);
             document.getElementById('st' + (i+1)).textContent = data.baseline_short[i].toFixed(0);
             document.getElementById('lt' + (i+1)).textContent = data.baseline_long[i].toFixed(0);
             
             let eventEl = document.getElementById('event' + (i+1));
-            if (data.mic[i] > data.baseline_long[i] * 1.2) {
+            if (data.rms[i] > data.baseline_long[i] * 1.2) {
               eventEl.className = 'event-indicator event-active';
             } else {
               eventEl.className = 'event-indicator event-inactive';
@@ -536,13 +568,16 @@ void handleRoot() {
 void handleData() {
   portENTER_CRITICAL(&dataMux);
   float local_P_values[4];
+  float local_rms[4];
   float local_db[4];
   memcpy(local_P_values, P_muot_values, sizeof(P_muot_values));
+  memcpy(local_rms, rms_values, sizeof(rms_values));
   memcpy(local_db, db_values, sizeof(db_values));
   portEXIT_CRITICAL(&dataMux);
   
   String json = "{";
   json += "\"mic\":[" + String(local_P_values[0]) + "," + String(local_P_values[1]) + "," + String(local_P_values[2]) + "," + String(local_P_values[3]) + "],";
+  json += "\"rms\":[" + String(local_rms[0]) + "," + String(local_rms[1]) + "," + String(local_rms[2]) + "," + String(local_rms[3]) + "],";
   json += "\"db\":[" + String(local_db[0]) + "," + String(local_db[1]) + "," + String(local_db[2]) + "," + String(local_db[3]) + "],";
   json += "\"baseline_short\":[" + String(short_term_baseline[0]) + "," + String(short_term_baseline[1]) + "," + String(short_term_baseline[2]) + "," + String(short_term_baseline[3]) + "],";
   json += "\"baseline_long\":[" + String(long_term_baseline[0]) + "," + String(long_term_baseline[1]) + "," + String(long_term_baseline[2]) + "," + String(long_term_baseline[3]) + "],";
@@ -599,7 +634,7 @@ void handleSetYellow() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 Noise Monitor with dB and Baseline Tracking");
+  Serial.println("ESP32 Noise Monitor with RMS, dB and Baseline Tracking");
   
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, FALLING);
@@ -610,14 +645,12 @@ void setup() {
   Serial.print("AP IP address: ");
   Serial.println(IP);
 
-  // Khởi tạo ESP-NOW
   if (esp_now_init() != ESP_OK) {
     Serial.println("Loi khoi tao ESP-NOW");
     return;
   }
   esp_now_register_recv_cb(OnDataRecv);
 
-  // Khởi tạo Web Server
   server.on("/", handleRoot);
   server.on("/data", handleData);
   server.on("/setMode", handleSetMode);
@@ -629,7 +662,6 @@ void setup() {
   
   Serial.println("Web server started!");
   
-  // Khởi tạo LED strips
   strip_Vung.begin();
   strip_Vung.setBrightness(10);
   strip_Vung.clear();
@@ -646,8 +678,10 @@ void setup() {
   strip_Mode.show();
   stripDB_Mode.show();
   
-  // Khởi tạo min filter buffer
   for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < RMS_WINDOW_SIZE; j++) {
+      rms_buffer[i][j] = 0.0;
+    }
     for (int j = 0; j < MIN_FILTER_SIZE; j++) {
       min_filter_buffer[i][j] = 0.0;
     }
@@ -661,17 +695,16 @@ void loop() {
   
   unsigned long current_time = millis();
   
-  // Kiểm tra timeout của các mic
   portENTER_CRITICAL(&dataMux);
   for (int i = 0; i < NUM_MICS; i++) {
     if (current_time - last_receive_time[i] > MIC_TIMEOUT) {
       P_muot_values[i] = 0.0;
+      rms_values[i] = 0.0;
       db_values[i] = 0.0;
     }
   }
   portEXIT_CRITICAL(&dataMux);
   
-  // Xử lý nút bấm
   if (buttonPressed) {
     portENTER_CRITICAL(&mux);
     buttonPressed = false;
@@ -693,21 +726,17 @@ void loop() {
     updateModeLED();
   }
 
-  // Cập nhật LED
   if (current_time - lastLEDUpdate >= LED_UPDATE_INTERVAL) {
     lastLEDUpdate = current_time;
     
     if (count == 0) {
       // MODE 0: TẮT
     } else {
-      // MODE 1 hoặc 2: Tính toán và hiển thị LED
-      
       portENTER_CRITICAL(&dataMux);
       float local_P_values[4];
       memcpy(local_P_values, P_muot_values, sizeof(P_muot_values));
       portEXIT_CRITICAL(&dataMux);
       
-      // === TÍNH IDW CHO CÁC VÙNG ===
       for (int i = 0; i < NUM_ZONES; i++) {
         float vung_x = ZONE_CENTERS[i][0];
         float vung_y = ZONE_CENTERS[i][1];
@@ -734,7 +763,6 @@ void loop() {
         }
       }
       
-      // === TÌM GIÁ TRỊ MAX ===
       float P_max = 0.0;
       for (int i = 0; i < NUM_ZONES; i++) {
         if (P_est_zones[i] > P_max) {
@@ -742,14 +770,12 @@ void loop() {
         }
       }
       
-      // === TÍNH NGƯỠNG ===
       float P_nguong_min = (count == 1) ? P_NGUONG_MODE_1 : P_NGUONG_MODE_2;
       float P_nguong_vang = P_max * PHAN_TRAM_VANG;
       if (P_nguong_vang < P_nguong_min) {
         P_nguong_vang = P_nguong_min;
       }
 
-      // === HIỂN THỊ LED ===
       for (int i = 0; i < NUM_ZONES; i++) {
         int led1 = ZONE_TO_LED_MAP[i][0];
         int led2 = ZONE_TO_LED_MAP[i][1];
