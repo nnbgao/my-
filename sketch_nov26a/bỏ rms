@@ -395,28 +395,28 @@ void handleRoot() {
         <div class="sensor-box">
           <div>Mic 1 <span class="event-indicator" id="event1"></span></div>
           <div class="sensor-value" id="mic1">0</div>
-          <div class="sensor-detail">RMS: <span id="rms1">0</span></div>
+         
           <div class="sensor-detail">dB: <span id="db1">0</span> dB</div>
           <div class="baseline-info">Baseline - ST: <span id="st1">0</span> | LT: <span id="lt1">0</span></div>
         </div>
         <div class="sensor-box">
           <div>Mic 2 <span class="event-indicator" id="event2"></span></div>
           <div class="sensor-value" id="mic2">0</div>
-          <div class="sensor-detail">RMS: <span id="rms2">0</span></div>
+        
           <div class="sensor-detail">dB: <span id="db2">0</span> dB</div>
           <div class="baseline-info">Baseline - ST: <span id="st2">0</span> | LT: <span id="lt2">0</span></div>
         </div>
         <div class="sensor-box">
           <div>Mic 3 <span class="event-indicator" id="event3"></span></div>
           <div class="sensor-value" id="mic3">0</div>
-          <div class="sensor-detail">RMS: <span id="rms3">0</span></div>
+        
           <div class="sensor-detail">dB: <span id="db3">0</span> dB</div>
           <div class="baseline-info">Baseline - ST: <span id="st3">0</span> | LT: <span id="lt3">0</span></div>
         </div>
         <div class="sensor-box">
           <div>Mic 4 <span class="event-indicator" id="event4"></span></div>
           <div class="sensor-value" id="mic4">0</div>
-          <div class="sensor-detail">RMS: <span id="rms4">0</span></div>
+          
           <div class="sensor-detail">dB: <span id="db4">0</span> dB</div>
           <div class="baseline-info">Baseline - ST: <span id="st4">0</span> | LT: <span id="lt4">0</span></div>
         </div>
