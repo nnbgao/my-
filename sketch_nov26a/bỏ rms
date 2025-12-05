@@ -446,7 +446,7 @@ void handleRoot() {
     </div>
 
     <div class="card">
-      <h2>🎮 Điều khiển Mode</h2>
+      <h2>🎮 Điều chỉnh chế độ</h2>
       <div class="mode-buttons">
         <button class="btn btn-mode0" onclick="setMode(0)">Mode 0: TẮT</button>
         <button class="btn btn-mode1" onclick="setMode(1)">Mode 1: Bình thường</button>
