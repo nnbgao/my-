@@ -92,6 +92,7 @@ const char* password = "12345678";
 
 // --- Biến lưu giá trị zones ---
 float P_est_zones[NUM_ZONES] = {0, 0, 0, 0};
+int led_zone_status[4] = {0, 0, 0, 0};  // 0: xanh, 1: đỏ
 
 // --- Timing cho loop không blocking ---
 unsigned long lastLEDUpdate = 0;
@@ -260,8 +261,8 @@ void handleRoot() {
     body { 
       font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
       background-image: 
-        linear-gradient(0deg, transparent 24%, rgba(129,199,132,0.4) 25%, rgba(129,199,132,0.4) 26%, transparent 27%, transparent 74%, rgba(129,199,132,0.4) 75%, rgba(129,199,132,0.4) 76%, transparent 77%, transparent),
-        linear-gradient(90deg, transparent 24%, rgba(129,199,132,0.4) 25%, rgba(129,199,132,0.4) 26%, transparent 27%, transparent 74%, rgba(129,199,132,0.4) 75%, rgba(129,199,132,0.4) 76%, transparent 77%, transparent);
+        linear-gradient(0deg, transparent 24%, rgba(129,199,132,0.4) 25%, rgba(129,199,132,0.4) 26%, transparent 27%, transparent 74%, rgba(129,199,132,0.4) 75%, rgba(129,199,132,0.4) 76%, transparent 77%),
+        linear-gradient(90deg, transparent 24%, rgba(129,199,132,0.4) 25%, rgba(129,199,132,0.4) 26%, transparent 27%, transparent 74%, rgba(129,199,132,0.4) 75%, rgba(129,199,132,0.4) 76%, transparent 77%);
       background-size: 80px 80px;
       background-color: #f1f8e9;
       color: #1a1a1a;
@@ -381,16 +382,71 @@ void handleRoot() {
     }
     .event-active { background: #ff4444; }
     .event-inactive { background: #44ff44; }
+
+    /* Vẽ matrix 4 vùng - 4 hình chữ nhật nhỏ */
+    .zone-matrix {
+      text-align: center;
+      margin: 20px 0;
+    }
+    .matrix-container {
+      display: grid;
+      grid-template-columns: 42px 42px;
+      grid-template-rows: 42px 42px;
+      gap: 10px;
+      background: #f1f8e9;
+      justify-content: center;
+      align-items: center;
+      border: 3px solid #81c784;
+      border-radius: 14px;
+      width: 110px;
+      margin: 0 auto;
+      padding: 10px;
+    }
+    .zone-cell {
+      width: 42px;
+      height: 42px;
+      background: #44ff44;
+      border-radius: 6px;
+      border: 2.5px solid #888;
+      transition: background 0.3s, box-shadow 0.3s;
+      box-shadow: 0 0 3px #7ad986;
+    }
+    .zone-cell.red {
+      background: #ff2222;
+      box-shadow: 0 0 12px #ff2828cc;
+      border: 2.5px solid #ff5858;
+    }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>📊 Noise Monitor Dashboard (RMS & dB)</h1>
+    <h1>📊 Noise Monitor Dashboard (dB)</h1>
     
     <div class="status" id="status">Đang tải...</div>
-    
+
+    <div class="card" style="margin-bottom: 0;">
+      <h2>🎮 Điều chỉnh chế độ</h2>
+      <div class="mode-buttons">
+        <button class="btn btn-mode0" onclick="setMode(0)">Mode 0: TẮT</button>
+        <button class="btn btn-mode1" onclick="setMode(1)">Mode 1: Bình thường</button>
+        <button class="btn btn-mode2" onclick="setMode(2)">Mode 2: Yên tĩnh</button>
+      </div>
+    </div>
+
+    <div class="zone-matrix">
+      <div class="matrix-container">
+        <div class="zone-cell" id="zonecell1" title="Vùng 1"></div>
+        <div class="zone-cell" id="zonecell2" title="Vùng 2"></div>
+        <div class="zone-cell" id="zonecell3" title="Vùng 3"></div>
+        <div class="zone-cell" id="zonecell4" title="Vùng 4"></div>
+      </div>
+      <div style="font-size: 0.93em; margin-top: 8px; color: #888;">
+        4 vùng mô phỏng LED Matrix: Nếu vùng nào đỏ ngoài thực tế thì vùng tương ứng cũng đỏ
+      </div>
+    </div>
+
     <div class="card">
-      <h2>🎤 Giá trị Microphone (Real-time RMS & dB)</h2>
+      <h2>🎤 Giá trị Microphone (Real-time dB)</h2>
       <div class="grid">
         <div class="sensor-box">
           <div>Mic 1 <span class="event-indicator" id="event1"></span></div>
@@ -446,15 +502,6 @@ void handleRoot() {
     </div>
 
     <div class="card">
-      <h2>🎮 Điều chỉnh chế độ</h2>
-      <div class="mode-buttons">
-        <button class="btn btn-mode0" onclick="setMode(0)">Mode 0: TẮT</button>
-        <button class="btn btn-mode1" onclick="setMode(1)">Mode 1: Bình thường</button>
-        <button class="btn btn-mode2" onclick="setMode(2)">Mode 2: Yên tĩnh</button>
-      </div>
-    </div>
-
-    <div class="card">
       <h2>⚙️ Cài đặt Ngưỡng</h2>
       <form id="settingsForm">
         <div class="setting-row">
@@ -498,7 +545,7 @@ void handleRoot() {
         .then(data => {
           for (let i = 0; i < 4; i++) {
             document.getElementById('mic' + (i+1)).textContent = data.mic[i].toFixed(0);
-            document.getElementById('rms' + (i+1)).textContent = data.rms[i].toFixed(2);
+            document.getElementById('rms' + (i+1))?.textContent = data.rms[i].toFixed(2);
             document.getElementById('db' + (i+1)).textContent = data.db[i].toFixed(1);
             document.getElementById('st' + (i+1)).textContent = data.baseline_short[i].toFixed(0);
             document.getElementById('lt' + (i+1)).textContent = data.baseline_long[i].toFixed(0);
@@ -515,6 +562,15 @@ void handleRoot() {
             document.getElementById('zone' + (i+1)).textContent = data.zones[i].toFixed(0);
           }
           
+          // Update matrix 4 vùng góc
+          for (let i = 0; i < 4; i++) {
+            let cell = document.getElementById('zonecell' + (i+1));
+            if (data.led_zone_status && data.led_zone_status[i] === 1)
+              cell.classList.add('red');
+            else
+              cell.classList.remove('red');
+          }
+
           let modeText = ['MODE 0: TẮT', 'MODE 1: Bình thường', 'MODE 2: Yên tĩnh'];
           document.getElementById('status').textContent = modeText[data.mode];
         })
@@ -573,6 +629,8 @@ void handleData() {
   memcpy(local_P_values, P_muot_values, sizeof(P_muot_values));
   memcpy(local_rms, rms_values, sizeof(rms_values));
   memcpy(local_db, db_values, sizeof(db_values));
+  int local_led_zone_status[4];
+  memcpy(local_led_zone_status, led_zone_status, sizeof(led_zone_status));
   portEXIT_CRITICAL(&dataMux);
   
   String json = "{";
@@ -582,7 +640,9 @@ void handleData() {
   json += "\"baseline_short\":[" + String(short_term_baseline[0]) + "," + String(short_term_baseline[1]) + "," + String(short_term_baseline[2]) + "," + String(short_term_baseline[3]) + "],";
   json += "\"baseline_long\":[" + String(long_term_baseline[0]) + "," + String(long_term_baseline[1]) + "," + String(long_term_baseline[2]) + "," + String(long_term_baseline[3]) + "],";
   json += "\"zones\":[" + String(P_est_zones[0]) + "," + String(P_est_zones[1]) + "," + String(P_est_zones[2]) + "," + String(P_est_zones[3]) + "],";
-  json += "\"mode\":" + String(count);
+  json += "\"mode\":" + String(count) + ",";
+  json += "\"led_zone_status\":[" + String(local_led_zone_status[0]) + "," + String(local_led_zone_status[1]) + "," +
+          String(local_led_zone_status[2]) + "," + String(local_led_zone_status[3]) + "]";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -731,6 +791,7 @@ void loop() {
     
     if (count == 0) {
       // MODE 0: TẮT
+      for (int i = 0; i < NUM_ZONES; i++) led_zone_status[i] = 0;
     } else {
       portENTER_CRITICAL(&dataMux);
       float local_P_values[4];
@@ -785,10 +846,13 @@ void loop() {
         uint32_t color;
         if (P_est_zones[i] >= P_max && P_max > P_nguong_min) {
           color = strip_Vung.Color(255, 0, 0);
+          led_zone_status[i] = 1;
         } else if (P_est_zones[i] > P_nguong_vang) {
           color = strip_Vung.Color(255, 150, 0);
+          led_zone_status[i] = 0;
         } else {
           color = strip_Vung.Color(0, 255, 0);
+          led_zone_status[i] = 0;
         }
         
         strip_Vung.setPixelColor(led1, color);
