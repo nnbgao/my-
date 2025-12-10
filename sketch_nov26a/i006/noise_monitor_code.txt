@@ -1,0 +1,925 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <cmath>
+#include <Adafruit_NeoPixel.h>
+
+// --- Cấu hình chân ---
+const int BUTTON_PIN = 12;
+
+// --- DẢI LED ---
+#define LED_VUNG_PIN    23
+#define LED_VUNG_COUNT  16
+Adafruit_NeoPixel strip_Vung(LED_VUNG_COUNT, LED_VUNG_PIN, NEO_GRB + NEO_KHZ800);
+
+#define LED_MODE_PIN    19
+Adafruit_NeoPixel strip_Mode(1, LED_MODE_PIN, NEO_GRB + NEO_KHZ800);
+#define LED_DB_PIN    18
+Adafruit_NeoPixel stripDB_Mode(1, LED_DB_PIN, NEO_GRB + NEO_KHZ800);
+
+// --- GIÁ TRỊ TÍN HIỆU ---
+float P_muot_values[4] = {0.0, 0.0, 0.0, 0.0}; 
+unsigned long last_receive_time[4] = {0, 0, 0, 0};
+
+// --- RMS và dB ---
+#define RMS_WINDOW_SIZE 10
+#define MIN_FILTER_SIZE 5
+
+float rms_buffer[4][RMS_WINDOW_SIZE];
+int rms_index[4] = {0, 0, 0, 0};
+bool rms_buffer_filled[4] = {false, false, false, false};
+
+float rms_values[4] = {0.0, 0.0, 0.0, 0.0};
+float db_values[4] = {0.0, 0.0, 0.0, 0.0};
+
+// Baseline tracking
+float short_term_baseline[4] = {0.0, 0.0, 0.0, 0.0};
+float long_term_baseline[4] = {0.0, 0.0, 0.0, 0.0};
+float min_filter_buffer[4][MIN_FILTER_SIZE];
+int min_filter_index[4] = {0, 0, 0, 0};
+bool min_filter_filled[4] = {false, false, false, false};
+
+unsigned long last_baseline_update[4] = {0, 0, 0, 0};
+unsigned long event_start_time[4] = {0, 0, 0, 0};
+bool in_event[4] = {false, false, false, false};
+
+const float BASELINE_INCREASE_RATE = 0.0002;
+const float BASELINE_DECREASE_RATE = 0.03;
+const unsigned long BASELINE_UPDATE_INTERVAL = 100;
+const unsigned long EVENT_FREEZE_TIME = 4000;
+const float EVENT_THRESHOLD_RATIO = 1.2;
+const float REFERENCE_PRESSURE = 0.00002;
+
+// --- Ngưỡng ---
+float P_NGUONG_MODE_1 = 200.0;
+float P_NGUONG_MODE_2 = 150.0;
+float P_NGUONG_MIC_MIN = 50.0;
+float PHAN_TRAM_VANG = 0.65;
+
+const unsigned long MIC_TIMEOUT = 5000;
+
+// --- Biến trạng thái ---
+volatile int count = 1;
+volatile bool buttonPressed = false; 
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
+unsigned long lastDebounceTime = 0; 
+unsigned long debounceDelay = 800;
+
+// --- Đảo ngược vùng CHỈ cho hiển thị web ---
+bool zone_reversed = false;
+
+// --- Hiệu chuẩn & Tọa độ ---
+float CALIBRATION_FACTORS[4] = {0.93, 0.83, 0.646, 0.67};
+
+const int NUM_MICS = 4;
+const float MIC_POSITIONS[NUM_MICS][2] = {
+  {0.0, 0.0}, {10, 0.0}, {0.0, 14.5}, {10.0, 14.5}
+};
+
+const int NUM_ZONES = 4;
+const float ZONE_CENTERS[NUM_ZONES][2] = {
+  {4.72, 5.35}, {8.5, 5.35}, {4.72, 11.59} , {8.5, 11.59}
+};
+
+const int ZONE_TO_LED_MAP[NUM_ZONES][4] = {
+  {9, 8, 15, 14}, {0, 1, 6, 7}, {10, 11, 12, 13}, {2, 3, 4, 5}
+};
+
+// Map đảo ngược CHỈ cho hiển thị web: Zone 0↔2, 1↔3
+const int WEB_ZONE_REVERSE_MAP[4] = {2, 3, 0, 1};
+
+// --- Web Server ---
+WebServer server(80);
+
+// --- WiFi AP Config ---
+const char* ssid = "ESP32_NoiseMonitor";
+const char* password = "12345678";
+
+// --- Biến lưu giá trị zones ---
+float P_est_zones[NUM_ZONES] = {0, 0, 0, 0};
+int led_zone_status[4] = {0, 0, 0, 0};
+
+// --- Timing ---
+unsigned long lastLEDUpdate = 0;
+const unsigned long LED_UPDATE_INTERVAL = 680;
+
+double tinh_khoang_cach(double vung_x, double vung_y, double mic_x, double mic_y) {
+  double delta_x = vung_x - mic_x;
+  double delta_y = vung_y - mic_y;
+  return sqrt(delta_x * delta_x + delta_y * delta_y);
+}
+
+typedef struct struct_message {
+  int id;
+  float p_value;
+} struct_message;
+
+void IRAM_ATTR handleButtonInterrupt() {
+  if (millis() - lastDebounceTime > debounceDelay) {
+    portENTER_CRITICAL_ISR(&mux);
+    buttonPressed = true;
+    lastDebounceTime = millis();
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+}
+
+void updateBaseline(int mic_index) {
+  unsigned long current_time = millis();
+  
+  if (current_time - last_baseline_update[mic_index] < BASELINE_UPDATE_INTERVAL) {
+    return;
+  }
+  last_baseline_update[mic_index] = current_time;
+  
+  float current_rms = rms_values[mic_index];
+  if (current_rms < 0.0001) return;
+  
+  min_filter_buffer[mic_index][min_filter_index[mic_index]] = current_rms;
+  min_filter_index[mic_index] = (min_filter_index[mic_index] + 1) % MIN_FILTER_SIZE;
+  if (min_filter_index[mic_index] == 0) min_filter_filled[mic_index] = true;
+  
+  float min_value = current_rms;
+  int count_min = min_filter_filled[mic_index] ? MIN_FILTER_SIZE : min_filter_index[mic_index];
+  
+  if (count_min > 0) {
+    for (int i = 0; i < count_min; i++) {
+      if (min_filter_buffer[mic_index][i] < min_value) {
+        min_value = min_filter_buffer[mic_index][i];
+      }
+    }
+  } else {
+    return;
+  }
+  
+  if (long_term_baseline[mic_index] > 0 && 
+      current_rms > long_term_baseline[mic_index] * EVENT_THRESHOLD_RATIO) {
+    if (!in_event[mic_index]) {
+      in_event[mic_index] = true;
+      event_start_time[mic_index] = current_time;
+    }
+  } else {
+    in_event[mic_index] = false;
+  }
+  
+  if (in_event[mic_index] && (current_time - event_start_time[mic_index] < EVENT_FREEZE_TIME)) {
+    return;
+  }
+  
+  if (long_term_baseline[mic_index] == 0.0) {
+    long_term_baseline[mic_index] = min_value;
+    short_term_baseline[mic_index] = current_rms;
+    return;
+  }
+  
+  if (current_rms < short_term_baseline[mic_index]) {
+    short_term_baseline[mic_index] = short_term_baseline[mic_index] * (1.0 - BASELINE_DECREASE_RATE) + 
+                                     current_rms * BASELINE_DECREASE_RATE;
+  } else {
+    short_term_baseline[mic_index] = short_term_baseline[mic_index] * (1.0 - BASELINE_INCREASE_RATE) + 
+                                     current_rms * BASELINE_INCREASE_RATE;
+  }
+  
+  if (min_value < long_term_baseline[mic_index]) {
+    long_term_baseline[mic_index] = long_term_baseline[mic_index] * (1.0 - BASELINE_DECREASE_RATE) + 
+                                    min_value * BASELINE_DECREASE_RATE;
+  } else {
+    long_term_baseline[mic_index] = long_term_baseline[mic_index] * (1.0 - BASELINE_INCREASE_RATE) + 
+                                    min_value * BASELINE_INCREASE_RATE;
+  }
+}
+
+void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
+  struct_message myData;
+  memcpy(&myData, incomingData, sizeof(myData));
+  int slave_id = myData.id;
+  float p_value_tho = myData.p_value;
+  
+  Serial.print("Received Mic ");
+  Serial.print(slave_id);
+  Serial.print(": ");
+  Serial.println(p_value_tho);
+  
+  if (slave_id >= 1 && slave_id <= 4) {
+    int index = slave_id - 1;
+    float calibrated_value = p_value_tho * CALIBRATION_FACTORS[index];
+    
+    rms_buffer[index][rms_index[index]] = calibrated_value * calibrated_value;
+    rms_index[index] = (rms_index[index] + 1) % RMS_WINDOW_SIZE;
+    if (rms_index[index] == 0) rms_buffer_filled[index] = true;
+    
+    float sum = 0;
+    int count_samples = rms_buffer_filled[index] ? RMS_WINDOW_SIZE : rms_index[index];
+    float temp_rms = 0.0;
+    
+    if (count_samples > 0) {
+      for (int i = 0; i < count_samples; i++) {
+        sum += rms_buffer[index][i];
+      }
+      temp_rms = sqrt(sum / count_samples);
+    }
+    
+    float V_pp = temp_rms * (3.3 / 4095.0);
+    float V_rms = V_pp * 0.3535;
+    if (V_rms < 0.00001) V_rms = 0.00001;
+    float temp_db = 20 * log10(V_rms) + 80.65;
+    
+    portENTER_CRITICAL(&dataMux);
+    P_muot_values[index] = calibrated_value;
+    rms_values[index] = temp_rms;
+    db_values[index] = temp_db;
+    last_receive_time[index] = millis();
+    portEXIT_CRITICAL(&dataMux);
+    
+    updateBaseline(index);
+  }
+}
+
+void updateModeLED() {
+  if (count == 0) {
+    strip_Mode.setPixelColor(0, strip_Mode.Color(100, 100, 100));
+  } else if (count == 1) {
+    strip_Mode.setPixelColor(0, strip_Mode.Color(0, 255, 0));
+  } else {
+    strip_Mode.setPixelColor(0, strip_Mode.Color(255, 0, 0));
+  }
+  strip_Mode.show();
+}
+
+void updateDBLED() {
+  // Tính dB trung bình
+  float avgDb = (db_values[0] + db_values[1] + db_values[2] + db_values[3]) / 4.0;
+  
+  if (avgDb >= 70.0) {
+    // Đỏ khi >= 70dB
+    stripDB_Mode.setPixelColor(0, stripDB_Mode.Color(255, 0, 0));
+  } else if (avgDb >= 65.0) {
+    // Xanh lá khi >= 65dB
+    stripDB_Mode.setPixelColor(0, stripDB_Mode.Color(0, 255, 0));
+  } else {
+    // Xám khi < 65dB
+    stripDB_Mode.setPixelColor(0, stripDB_Mode.Color(100, 100, 100));
+  }
+  stripDB_Mode.show();
+}
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Noise Monitor Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-image: 
+        linear-gradient(0deg, transparent 24%, rgba(129,199,132,0.4) 25%, rgba(129,199,132,0.4) 26%, transparent 27%, transparent 74%, rgba(129,199,132,0.4) 75%, rgba(129,199,132,0.4) 76%, transparent 77%),
+        linear-gradient(90deg, transparent 24%, rgba(129,199,132,0.4) 25%, rgba(129,199,132,0.4) 26%, transparent 27%, transparent 74%, rgba(129,199,132,0.4) 75%, rgba(129,199,132,0.4) 76%, transparent 77%);
+      background-size: 80px 80px;
+      background-color: #f1f8e9;
+      color: #1a1a1a;
+      padding: 20px;
+      min-height: 100vh;
+    }
+    .container { max-width: 1400px; margin: 0 auto; }
+    h1 { 
+      text-align: center; 
+      margin-bottom: 30px; 
+      font-size: 2.5em; 
+      color: #558b2f;
+      text-shadow: 2px 2px 4px rgba(129,199,132,0.3);
+      background: rgba(241,248,233,0.95);
+      padding: 20px;
+      border-radius: 15px;
+      box-shadow: 0 4px 16px rgba(129,199,132,0.3);
+      border: 2px solid #81c784;
+    }
+    .card { 
+      background: rgba(241,248,233,0.95);
+      backdrop-filter: blur(10px);
+      border-radius: 15px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 4px 16px rgba(129,199,132,0.3);
+      border: 2px solid #81c784;
+    }
+    h2 {
+      color: #558b2f;
+      margin-bottom: 15px;
+      border-bottom: 2px solid #81c784;
+      padding-bottom: 10px;
+      font-weight: 600;
+    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 15px; }
+    .sensor-box {
+      background: linear-gradient(135deg, #66bb6a 0%, #81c784 100%);
+      color: #fff;
+      padding: 15px;
+      border-radius: 10px;
+      text-align: center;
+      box-shadow: 0 4px 12px rgba(129,199,132,0.3);
+    }
+    .sensor-value {
+      font-size: 2em;
+      font-weight: bold;
+      margin: 10px 0;
+      color: #fff;
+    }
+    .sensor-detail {
+      font-size: 0.85em;
+      margin: 5px 0;
+      opacity: 0.95;
+    }
+    .mode-buttons {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .btn {
+      padding: 12px 30px;
+      border: 2px solid #81c784;
+      border-radius: 8px;
+      font-size: 1em;
+      cursor: pointer;
+      transition: all 0.3s;
+      font-weight: bold;
+      background: #f1f8e9;
+      color: #558b2f;
+    }
+    .btn-mode0 { background: #95a5a6; color: white; border-color: #7f8c8d; }
+    .btn-mode1 { background: #27ae60; color: white; border-color: #229954; }
+    .btn-mode2 { background: #e74c3c; color: white; border-color: #c0392b; }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(129,199,132,0.4); }
+    .btn:active { transform: translateY(0); }
+    input[type="number"] {
+      padding: 8px;
+      border-radius: 5px;
+      border: 2px solid #81c784;
+      width: 100px;
+      font-size: 1em;
+      background: #f1f8e9;
+    }
+    .setting-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin: 10px 0;
+      padding: 10px;
+      background: rgba(129,199,132,0.1);
+      border-radius: 8px;
+      border: 1px solid #81c784;
+    }
+    .status { 
+      font-size: 1.5em; 
+      text-align: center; 
+      padding: 15px;
+      background: linear-gradient(135deg, #66bb6a 0%, #81c784 100%);
+      color: #fff;
+      border-radius: 10px;
+      margin-bottom: 20px;
+      box-shadow: 0 4px 12px rgba(129,199,132,0.3);
+    }
+    .baseline-info {
+      font-size: 0.75em;
+      color: #ffd700;
+      margin-top: 5px;
+    }
+    .event-indicator {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-left: 5px;
+    }
+    .event-active { background: #ff4444; }
+    .event-inactive { background: #44ff44; }
+    .zone-container {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 20px;
+      margin: 20px 0;
+    }
+    .zone-matrix {
+      text-align: center;
+    }
+    .matrix-container {
+      display: grid;
+      grid-template-columns: 42px 42px;
+      grid-template-rows: 42px 42px;
+      gap: 10px;
+      background: #f1f8e9;
+      justify-content: center;
+      align-items: center;
+      border: 3px solid #81c784;
+      border-radius: 14px;
+      width: 110px;
+      margin: 0 auto;
+      padding: 10px;
+    }
+    .zone-cell {
+      width: 42px;
+      height: 42px;
+      background: #44ff44;
+      border-radius: 6px;
+      border: 2.5px solid #888;
+      transition: background 0.3s, box-shadow 0.3s;
+      box-shadow: 0 0 3px #7ad986;
+    }
+    .zone-cell.red {
+      background: #ff2222;
+      box-shadow: 0 0 12px #ff2828cc;
+      border: 2.5px solid #ff5858;
+    }
+    .reverse-btn {
+      padding: 15px 25px;
+      background: linear-gradient(135deg, #66bb6a 0%, #81c784 100%);
+      color: white;
+      border: none;
+      border-radius: 10px;
+      font-size: 1.2em;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(129,199,132,0.3);
+      transition: all 0.3s;
+      font-weight: bold;
+    }
+    .reverse-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(129,199,132,0.5);
+    }
+    .reverse-btn:active {
+      transform: translateY(0);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>📊 Noise Monitor Dashboard</h1>
+    
+    <div class="status" id="status">Đang tải...</div>
+
+    <div class="card">
+      <h2>🎮 Điều chỉnh chế độ <span id="moodEmoji" style="font-size: 1.5em;">😊</span></h2>
+      <div class="mode-buttons">
+        <button class="btn btn-mode0" onclick="setMode(0)">Mode 0: TẮT</button>
+        <button class="btn btn-mode1" onclick="setMode(1)">Mode 1: Bình thường</button>
+        <button class="btn btn-mode2" onclick="setMode(2)">Mode 2: Yên tĩnh</button>
+      </div>
+    </div>
+
+    <div class="zone-container">
+      <div class="zone-matrix">
+        <div class="matrix-container">
+          <div class="zone-cell" id="zonecell1"></div>
+          <div class="zone-cell" id="zonecell2"></div>
+          <div class="zone-cell" id="zonecell3"></div>
+          <div class="zone-cell" id="zonecell4"></div>
+        </div>
+      </div>
+      <button class="reverse-btn" onclick="toggleReverse()">🔄 Đảo Vùng</button>
+    </div>
+
+    <div class="card">
+      <h2>🎤 Giá trị Microphone</h2>
+      <div class="grid">
+        <div class="sensor-box">
+          <div>Mic 1 <span class="event-indicator" id="event1"></span></div>
+          <div class="sensor-value" id="mic1">0</div>
+          <div class="sensor-detail">dB: <span id="db1">0</span> dB</div>
+          <div class="baseline-info">ST: <span id="st1">0</span> | LT: <span id="lt1">0</span></div>
+        </div>
+        <div class="sensor-box">
+          <div>Mic 2 <span class="event-indicator" id="event2"></span></div>
+          <div class="sensor-value" id="mic2">0</div>
+          <div class="sensor-detail">dB: <span id="db2">0</span> dB</div>
+          <div class="baseline-info">ST: <span id="st2">0</span> | LT: <span id="lt2">0</span></div>
+        </div>
+        <div class="sensor-box">
+          <div>Mic 3 <span class="event-indicator" id="event3"></span></div>
+          <div class="sensor-value" id="mic3">0</div>
+          <div class="sensor-detail">dB: <span id="db3">0</span> dB</div>
+          <div class="baseline-info">ST: <span id="st3">0</span> | LT: <span id="lt3">0</span></div>
+        </div>
+        <div class="sensor-box">
+          <div>Mic 4 <span class="event-indicator" id="event4"></span></div>
+          <div class="sensor-value" id="mic4">0</div>
+          <div class="sensor-detail">dB: <span id="db4">0</span> dB</div>
+          <div class="baseline-info">ST: <span id="st4">0</span> | LT: <span id="lt4">0</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🎯 Giá trị Vùng</h2>
+      <div class="grid">
+        <div class="sensor-box">
+          <div>Vùng 1</div>
+          <div class="sensor-value" id="zone1">0</div>
+        </div>
+        <div class="sensor-box">
+          <div>Vùng 2</div>
+          <div class="sensor-value" id="zone2">0</div>
+        </div>
+        <div class="sensor-box">
+          <div>Vùng 3</div>
+          <div class="sensor-value" id="zone3">0</div>
+        </div>
+        <div class="sensor-box">
+          <div>Vùng 4</div>
+          <div class="sensor-value" id="zone4">0</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>⚙️ Cài đặt Ngưỡng</h2>
+      <div class="setting-row">
+        <label>Ngưỡng Mic Min:</label>
+        <input type="number" id="micMin" step="10" value="50">
+        <button class="btn" style="padding: 5px 15px;" onclick="updateMicMin()">Cập nhật</button>
+      </div>
+      <div class="setting-row">
+        <label>Ngưỡng Mode 1:</label>
+        <input type="number" id="mode1" step="10" value="200">
+        <button class="btn" style="padding: 5px 15px;" onclick="updateMode1()">Cập nhật</button>
+      </div>
+      <div class="setting-row">
+        <label>Ngưỡng Mode 2:</label>
+        <input type="number" id="mode2" step="10" value="150">
+        <button class="btn" style="padding: 5px 15px;" onclick="updateMode2()">Cập nhật</button>
+      </div>
+      <div class="setting-row">
+        <label>% Màu Vàng:</label>
+        <input type="number" id="yellow" step="0.05" value="0.65" min="0" max="1">
+        <button class="btn" style="padding: 5px 15px;" onclick="updateYellow()">Cập nhật</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function updateData() {
+      fetch('/data')
+        .then(r => r.json())
+        .then(data => {
+          // Tính dB trung bình từ tất cả các mic
+          let avgDb = (data.db[0] + data.db[1] + data.db[2] + data.db[3]) / 4;
+          
+          // Cập nhật emoji dựa trên dB trung bình
+          let moodEmoji = document.getElementById('moodEmoji');
+          if (avgDb >= 70) {
+            moodEmoji.textContent = '😡';  // Giận dữ
+          } else {
+            moodEmoji.textContent = '😊';  // Vui vẻ
+          }
+          
+          for (let i = 0; i < 4; i++) {
+            document.getElementById('mic' + (i+1)).textContent = data.mic[i].toFixed(0);
+            document.getElementById('db' + (i+1)).textContent = data.db[i].toFixed(1);
+            document.getElementById('st' + (i+1)).textContent = data.baseline_short[i].toFixed(0);
+            document.getElementById('lt' + (i+1)).textContent = data.baseline_long[i].toFixed(0);
+            
+            let eventEl = document.getElementById('event' + (i+1));
+            eventEl.className = data.rms[i] > data.baseline_long[i] * 1.2 ? 
+              'event-indicator event-active' : 'event-indicator event-inactive';
+          }
+          
+          for (let i = 0; i < 4; i++) {
+            document.getElementById('zone' + (i+1)).textContent = data.zones[i].toFixed(0);
+            let cell = document.getElementById('zonecell' + (i+1));
+            if (data.led_zone_status[i] === 1) cell.classList.add('red');
+            else cell.classList.remove('red');
+          }
+
+          let modes = ['MODE 0: TẮT', 'MODE 1: Bình thường', 'MODE 2: Yên tĩnh'];
+          document.getElementById('status').textContent = modes[data.mode];
+        })
+        .catch(e => console.error('Error:', e));
+    }
+
+    function setMode(mode) {
+      fetch('/setMode?mode=' + mode).then(() => updateData());
+    }
+
+    function toggleReverse() {
+      fetch('/toggleReverse').then(() => {
+        alert('Đã đảo vùng!');
+        updateData();
+      });
+    }
+
+    function updateMicMin() {
+      fetch('/setMicMin?value=' + document.getElementById('micMin').value)
+        .then(() => alert('Đã cập nhật!'));
+    }
+
+    function updateMode1() {
+      fetch('/setMode1?value=' + document.getElementById('mode1').value)
+        .then(() => alert('Đã cập nhật!'));
+    }
+
+    function updateMode2() {
+      fetch('/setMode2?value=' + document.getElementById('mode2').value)
+        .then(() => alert('Đã cập nhật!'));
+    }
+
+    function updateYellow() {
+      fetch('/setYellow?value=' + document.getElementById('yellow').value)
+        .then(() => alert('Đã cập nhật!'));
+    }
+
+    setInterval(updateData, 500);
+    updateData();
+  </script>
+</body>
+</html>
+)rawliteral";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  portENTER_CRITICAL(&dataMux);
+  float local_P[4], local_rms[4], local_db[4], local_zones[4];
+  int local_led[4];
+  memcpy(local_P, P_muot_values, sizeof(P_muot_values));
+  memcpy(local_rms, rms_values, sizeof(rms_values));
+  memcpy(local_db, db_values, sizeof(db_values));
+  memcpy(local_zones, P_est_zones, sizeof(P_est_zones));
+  memcpy(local_led, led_zone_status, sizeof(led_zone_status));
+  float local_st[4], local_lt[4];
+  memcpy(local_st, short_term_baseline, sizeof(short_term_baseline));
+  memcpy(local_lt, long_term_baseline, sizeof(long_term_baseline));
+  portEXIT_CRITICAL(&dataMux);
+  
+  // Đảo ngược CHỈ cho hiển thị web nếu được bật
+  float display_zones[4];
+  int display_led[4];
+  if (zone_reversed) {
+    for (int i = 0; i < 4; i++) {
+      int mapped_index = WEB_ZONE_REVERSE_MAP[i];
+      display_zones[i] = local_zones[mapped_index];
+      display_led[i] = local_led[mapped_index];
+    }
+  } else {
+    memcpy(display_zones, local_zones, sizeof(local_zones));
+    memcpy(display_led, local_led, sizeof(local_led));
+  }
+  
+  String json = "{";
+  json += "\"mic\":[" + String(local_P[0]) + "," + String(local_P[1]) + "," + String(local_P[2]) + "," + String(local_P[3]) + "],";
+  json += "\"rms\":[" + String(local_rms[0]) + "," + String(local_rms[1]) + "," + String(local_rms[2]) + "," + String(local_rms[3]) + "],";
+  json += "\"db\":[" + String(local_db[0]) + "," + String(local_db[1]) + "," + String(local_db[2]) + "," + String(local_db[3]) + "],";
+  json += "\"baseline_short\":[" + String(local_st[0]) + "," + String(local_st[1]) + "," + String(local_st[2]) + "," + String(local_st[3]) + "],";
+  json += "\"baseline_long\":[" + String(local_lt[0]) + "," + String(local_lt[1]) + "," + String(local_lt[2]) + "," + String(local_lt[3]) + "],";
+  json += "\"zones\":[" + String(display_zones[0]) + "," + String(display_zones[1]) + "," + String(display_zones[2]) + "," + String(display_zones[3]) + "],";
+  json += "\"mode\":" + String(count) + ",";
+  json += "\"led_zone_status\":[" + String(display_led[0]) + "," + String(display_led[1]) + "," + String(display_led[2]) + "," + String(display_led[3]) + "]";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetMode() {
+  if (server.hasArg("mode")) {
+    portENTER_CRITICAL(&mux);
+    count = server.arg("mode").toInt();
+    if (count < 0) count = 0;
+    if (count > 2) count = 2;
+    portEXIT_CRITICAL(&mux);
+    
+    updateModeLED();
+    if (count == 0) {
+      strip_Vung.clear();
+      strip_Vung.show();
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleToggleReverse() {
+  zone_reversed = !zone_reversed;
+  Serial.print("Zone reversed: ");
+  Serial.println(zone_reversed ? "TRUE" : "FALSE");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetMicMin() {
+  if (server.hasArg("value")) {
+    P_NGUONG_MIC_MIN = server.arg("value").toFloat();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetMode1() {
+  if (server.hasArg("value")) {
+    P_NGUONG_MODE_1 = server.arg("value").toFloat();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetMode2() {
+  if (server.hasArg("value")) {
+    P_NGUONG_MODE_2 = server.arg("value").toFloat();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetYellow() {
+  if (server.hasArg("value")) {
+    PHAN_TRAM_VANG = server.arg("value").toFloat();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 Noise Monitor Starting...");
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, FALLING);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP: ");
+  Serial.println(IP);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/setMode", handleSetMode);
+  server.on("/toggleReverse", handleToggleReverse);
+  server.on("/setMicMin", handleSetMicMin);
+  server.on("/setMode1", handleSetMode1);
+  server.on("/setMode2", handleSetMode2);
+  server.on("/setYellow", handleSetYellow);
+  server.begin();
+  
+  Serial.println("Web server started!");
+  
+  strip_Vung.begin();
+  strip_Vung.setBrightness(10);
+  strip_Vung.clear();
+  
+  strip_Mode.begin();
+  strip_Mode.setBrightness(10);
+  strip_Mode.setPixelColor(0, strip_Mode.Color(0, 255, 0));
+  
+  stripDB_Mode.begin();
+  stripDB_Mode.setBrightness(10);
+  stripDB_Mode.setPixelColor(0, stripDB_Mode.Color(100, 100, 100));
+  
+  strip_Vung.show();
+  strip_Mode.show();
+  stripDB_Mode.show();
+  
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < RMS_WINDOW_SIZE; j++) {
+      rms_buffer[i][j] = 0.0;
+    }
+    for (int j = 0; j < MIN_FILTER_SIZE; j++) {
+      min_filter_buffer[i][j] = 0.0;
+    }
+  }
+  
+  Serial.println("System ready!");
+}
+
+void loop() {
+  server.handleClient();
+  
+  unsigned long current_time = millis();
+  
+  portENTER_CRITICAL(&dataMux);
+  for (int i = 0; i < NUM_MICS; i++) {
+    if (current_time - last_receive_time[i] > MIC_TIMEOUT) {
+      P_muot_values[i] = 0.0;
+      rms_values[i] = 0.0;
+      db_values[i] = 0.0;
+    }
+  }
+  portEXIT_CRITICAL(&dataMux);
+  
+  // Cập nhật LED dB
+  updateDBLED();
+  
+  if (buttonPressed) {
+    portENTER_CRITICAL(&mux);
+    buttonPressed = false;
+    portEXIT_CRITICAL(&mux);
+
+    count++;
+    if (count > 2) count = 0;
+    
+    Serial.print("Mode changed to: ");
+    Serial.println(count);
+    
+    if (count == 0) {
+      strip_Vung.clear();
+      strip_Vung.show();
+    }
+    
+    updateModeLED();
+  }
+
+  if (current_time - lastLEDUpdate >= LED_UPDATE_INTERVAL) {
+    lastLEDUpdate = current_time;
+    
+    if (count == 0) {
+      portENTER_CRITICAL(&dataMux);
+      for (int i = 0; i < NUM_ZONES; i++) {
+        led_zone_status[i] = 0;
+        P_est_zones[i] = 0;
+      }
+      portEXIT_CRITICAL(&dataMux);
+    } else {
+      portENTER_CRITICAL(&dataMux);
+      float local_P_values[4];
+      memcpy(local_P_values, P_muot_values, sizeof(P_muot_values));
+      portEXIT_CRITICAL(&dataMux);
+      
+      float temp_zones[NUM_ZONES] = {0, 0, 0, 0};
+      
+      for (int i = 0; i < NUM_ZONES; i++) {
+        float vung_x = ZONE_CENTERS[i][0];
+        float vung_y = ZONE_CENTERS[i][1];
+        
+        float max_influence = 0.0;
+        
+        for (int j = 0; j < NUM_MICS; j++) {
+          if (local_P_values[j] < P_NGUONG_MIC_MIN) continue;
+          
+          float mic_x = MIC_POSITIONS[j][0];
+          float mic_y = MIC_POSITIONS[j][1];
+          double d = tinh_khoang_cach(vung_x, vung_y, mic_x, mic_y);
+          
+          float influence = (d > 0.001) ? (local_P_values[j] / (d * d * d * d)) : (local_P_values[j] * 10000.0);
+          
+          if (influence > max_influence) {
+            max_influence = influence;
+            temp_zones[i] = local_P_values[j];
+          }
+        }
+        
+        if (max_influence == 0.0) {
+          temp_zones[i] = 0.0;
+        }
+      }
+      
+      float P_max = 0.0;
+      for (int i = 0; i < NUM_ZONES; i++) {
+        if (temp_zones[i] > P_max) {
+          P_max = temp_zones[i];
+        }
+      }
+      
+      float P_nguong_min = (count == 1) ? P_NGUONG_MODE_1 : P_NGUONG_MODE_2;
+      float P_nguong_vang = P_max * PHAN_TRAM_VANG;
+      if (P_nguong_vang < P_nguong_min) {
+        P_nguong_vang = P_nguong_min;
+      }
+
+      int temp_led_status[4] = {0, 0, 0, 0};
+
+      for (int i = 0; i < NUM_ZONES; i++) {
+        // KHÔNG áp dụng đảo ngược ở đây - chỉ xử lý bình thường
+        int led1 = ZONE_TO_LED_MAP[i][0];
+        int led2 = ZONE_TO_LED_MAP[i][1];
+        int led3 = ZONE_TO_LED_MAP[i][2];
+        int led4 = ZONE_TO_LED_MAP[i][3];
+
+        uint32_t color;
+        if (temp_zones[i] >= P_max && P_max > P_nguong_min) {
+          color = strip_Vung.Color(255, 0, 0);
+          temp_led_status[i] = 1;
+        } else if (temp_zones[i] > P_nguong_vang) {
+          color = strip_Vung.Color(255, 150, 0);
+          temp_led_status[i] = 0;
+        } else {
+          color = strip_Vung.Color(0, 255, 0);
+          temp_led_status[i] = 0;
+        }
+        
+        strip_Vung.setPixelColor(led1, color);
+        strip_Vung.setPixelColor(led2, color);
+        strip_Vung.setPixelColor(led3, color);
+        strip_Vung.setPixelColor(led4, color);
+      }
+      
+      strip_Vung.show();
+      
+      portENTER_CRITICAL(&dataMux);
+      memcpy(P_est_zones, temp_zones, sizeof(temp_zones));
+      memcpy(led_zone_status, temp_led_status, sizeof(temp_led_status));
+      portEXIT_CRITICAL(&dataMux);
+    }
+  }
+}
