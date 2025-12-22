@@ -1,32 +1,43 @@
 /*
-  === ESP32-C3 Super Mini + INMP441 (Sender Node - Slave) ===
-  📡 Gửi dữ liệu dB qua ESP-NOW đến Master (ESP8266)
-  ✅ ĐÃ SỬA: Lỗi khai báo trùng masterAddress
-  🔌 PIN cho ESP32-C3: WS=4, SD=5, SCK=6
+  === ESP32-C3 Super Mini + INMP441 + FFT (Sender Node - Slave) ===
+  📡 Gửi dữ liệu dB + phân tích tần số qua ESP-NOW đến Master
+  🎵 Sử dụng ArduinoFFT để phân tích Bass/Mid/Treble
+  🔌 PIN: WS=4, SD=5, SCK=6
 */
 
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <esp_now.h>
 #include <WiFi.h>
+#include <arduinoFFT.h>
 
 // ==== PIN cho ESP32-C3 Super Mini ====
 #define I2S_WS  4   // GPIO4 - LRCLK/WS
 #define I2S_SD  5   // GPIO5 - DOUT/SD (Data)
 #define I2S_SCK 6   // GPIO6 - BCLK/SCK
+
 #define SAMPLE_RATE 16000
-#define SAMPLES 256
+#define SAMPLES 512  // Tăng lên 512 cho FFT tốt hơn (phải là lũy thừa của 2)
 
 // ⚠️ QUAN TRỌNG: Thay bằng MAC thật của ESP8266 master
-// Để lấy MAC: chạy WiFi.macAddress() trên ESP8266
-uint8_t masterAddress[] = {0xB8, 0xD6, 0x1A, 0xB8, 0x9F, 0x8C};
+uint8_t masterAddress[] = {0x08, 0xF9, 0xE0, 0x5D, 0x41, 0x4B};
 
+// ==== Cấu trúc dữ liệu gửi đi ====
 typedef struct {
   float dB;
+  float bassLevel;    // 20-250 Hz
+  float midLevel;     // 250-2000 Hz
+  float trebleLevel;  // 2000-8000 Hz
+  float dominantFreq; // Tần số mạnh nhất
   uint8_t micID;
 } SoundData;
 
 SoundData soundPacket;
+
+// ==== FFT ====
+ArduinoFFT<double> FFT = ArduinoFFT<double>();
+double vReal[SAMPLES];
+double vImag[SAMPLES];
 
 void setupI2S() {
   i2s_config_t i2s_config = {
@@ -63,38 +74,87 @@ double calculateRMS(int32_t *data, int samples) {
   return sqrt(sum / samples);
 }
 
-// ==== Callback ESP-NOW (ESP-IDF v5+) ====
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("📤 Gửi đến: ");
-  for (int i = 0; i < 6; i++) {
-    Serial.printf("%02X", mac_addr[i]);
-    if (i < 5) Serial.print(":");
+// ==== Phân tích FFT ====
+void analyzeFFT(int32_t *buffer) {
+  // Chuẩn bị dữ liệu cho FFT
+  for (int i = 0; i < SAMPLES; i++) {
+    vReal[i] = (double)buffer[i] / 2147483648.0; // Normalize
+    vImag[i] = 0;
   }
-  Serial.print(" -> ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "✅ Thành công" : "❌ Thất bại");
+
+  // Thực hiện FFT
+  FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  FFT.complexToMagnitude(vReal, vImag, SAMPLES);
+
+  // Tính độ phân giải tần số
+  double freqResolution = (double)SAMPLE_RATE / SAMPLES; // ~31.25 Hz
+
+  // ==== Phân tích các dải tần ====
+  double bassSum = 0, midSum = 0, trebleSum = 0;
+  int bassCount = 0, midCount = 0, trebleCount = 0;
+
+  double maxMagnitude = 0;
+  int maxIndex = 0;
+
+  for (int i = 1; i < SAMPLES / 2; i++) { // Bỏ DC component (i=0)
+    double freq = i * freqResolution;
+    double magnitude = vReal[i];
+
+    // Tìm tần số mạnh nhất
+    if (magnitude > maxMagnitude) {
+      maxMagnitude = magnitude;
+      maxIndex = i;
+    }
+
+    // Phân loại theo dải tần
+    if (freq >= 20 && freq < 250) {
+      bassSum += magnitude;
+      bassCount++;
+    } else if (freq >= 250 && freq < 2000) {
+      midSum += magnitude;
+      midCount++;
+    } else if (freq >= 2000 && freq < 8000) {
+      trebleSum += magnitude;
+      trebleCount++;
+    }
+  }
+
+  // Tính trung bình và chuyển sang dB
+  soundPacket.bassLevel = bassCount > 0 ? 20 * log10(bassSum / bassCount + 0.0001) : 0;
+  soundPacket.midLevel = midCount > 0 ? 20 * log10(midSum / midCount + 0.0001) : 0;
+  soundPacket.trebleLevel = trebleCount > 0 ? 20 * log10(trebleSum / trebleCount + 0.0001) : 0;
+  soundPacket.dominantFreq = maxIndex * freqResolution;
+}
+
+// ==== Callback ESP-NOW (ESP-IDF v5.5+) ====
+void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  if (status != ESP_NOW_SEND_SUCCESS) {
+    Serial.println("❌ Gửi thất bại");
+  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("🔊 ESP32-C3 Super Mini - INMP441 Sender");
+  Serial.println("🔊 ESP32-C3 + INMP441 + FFT");
   
   setupI2S();
 
   WiFi.mode(WIFI_STA);
-  Serial.print("📍 MAC Address: ");
+  Serial.print("📍 MAC: ");
   Serial.println(WiFi.macAddress());
 
   // ==== Khởi tạo ESP-NOW ====
   if (esp_now_init() != ESP_OK) {
-    Serial.println("❌ Lỗi khởi tạo ESP-NOW");
+    Serial.println("❌ Lỗi ESP-NOW");
     return;
   }
   esp_now_register_send_cb(OnDataSent);
 
   // ==== Thêm Master peer ====
   esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, masterAddress, 6);  // ✅ Dùng biến global
+  memcpy(peerInfo.peer_addr, masterAddress, 6);
   peerInfo.channel = 1;
   peerInfo.encrypt = false;
   
@@ -103,45 +163,35 @@ void setup() {
     return;
   }
   
-  Serial.print("✅ Đã thêm Master: ");
-  for (int i = 0; i < 6; i++) {
-    Serial.printf("%02X", masterAddress[i]);
-    if (i < 5) Serial.print(":");
-  }
-  Serial.println();
-
-  soundPacket.micID = 1;  // Có thể đổi thành 2, 3... nếu có nhiều slave
+  Serial.println("✅ ESP-NOW sẵn sàng");
+  soundPacket.micID = 1;
 }
 
 void loop() {
   size_t bytes_read;
   int32_t buffer[SAMPLES];
   
-  // Đọc dữ liệu từ mic I2S
+  // Đọc dữ liệu từ mic
   i2s_read(I2S_NUM_0, (void*)buffer, sizeof(buffer), &bytes_read, portMAX_DELAY);
 
-  // Tính RMS và chuyển sang dB
+  // Tính tổng dB (RMS)
   double rms = calculateRMS(buffer, SAMPLES);
-  
-  // ✅ Tránh log10(0) gây lỗi
   if (rms < 0.0000001) rms = 0.0000001;
-  
-  double dB = 20 * log10(rms) + 94;  // Tham chiếu 94 dB SPL
-  soundPacket.dB = dB;
+  soundPacket.dB = 20 * log10(rms) + 94;
+
+  // Phân tích FFT
+  analyzeFFT(buffer);
 
   // Gửi qua ESP-NOW
-  esp_err_t result = esp_now_send(masterAddress, (uint8_t*)&soundPacket, sizeof(soundPacket));
-  
-  if (result != ESP_OK) {
-    Serial.println("⚠️ Lỗi gửi ESP-NOW");
-  }
+  esp_now_send(masterAddress, (uint8_t*)&soundPacket, sizeof(soundPacket));
 
-  // In ra Serial Monitor
-  Serial.print("📊 Mic #"); 
-  Serial.print(soundPacket.micID);
-  Serial.print(": "); 
-  Serial.print(dB, 1); 
-  Serial.println(" dB");
+  // In thông tin
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.printf("📊 Mic #%d | Tổng: %.1f dB\n", soundPacket.micID, soundPacket.dB);
+  Serial.printf("🎸 Bass:   %.1f dB (20-250Hz)\n", soundPacket.bassLevel);
+  Serial.printf("🎤 Mid:    %.1f dB (250-2kHz)\n", soundPacket.midLevel);
+  Serial.printf("🎺 Treble: %.1f dB (2k-8kHz)\n", soundPacket.trebleLevel);
+  Serial.printf("🎵 Dominant: %.0f Hz\n", soundPacket.dominantFreq);
   
-  delay(200);  // ✅ Giảm từ 500ms xuống 200ms để sampling nhanh hơn
+  delay(200);
 }
