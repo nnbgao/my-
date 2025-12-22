@@ -164,7 +164,11 @@ void setup() {
   }
   
   Serial.println("✅ ESP-NOW sẵn sàng");
-  soundPacket.micID = 1;
+  
+  // ⚠️ ĐỔI SỐ NÀY CHO TỪNG SLAVE: 1, 2, 3, 4
+  soundPacket.micID = 1;  // 👈 ĐỔI THÀNH 1, 2, 3, hoặc 4
+  
+  Serial.printf("🎤 Slave ID: %d\n", soundPacket.micID);
 }
 
 void loop() {
