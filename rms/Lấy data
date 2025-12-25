@@ -1,0 +1,162 @@
+/*
+  === ESP32-C3 Super Mini + INMP441 + FFT (Monitor Mode) ===
+  🎵 Đo và hiển thị Bass/Mid/Treble + dB lên Serial Monitor
+  🔌 PIN: WS=4, SD=5, SCK=6
+  
+  ✅ Không gửi ESP-NOW - Chỉ đo và in ra
+*/
+
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <arduinoFFT.h>
+
+// ==== PIN cho ESP32-C3 Super Mini ====
+#define I2S_WS  4   // GPIO4 - LRCLK/WS
+#define I2S_SD  5   // GPIO5 - DOUT/SD (Data)
+#define I2S_SCK 6   // GPIO6 - BCLK/SCK
+
+#define SAMPLE_RATE 16000
+#define SAMPLES 512  // FFT samples (phải là lũy thừa của 2)
+
+// ==== Cấu trúc dữ liệu đo ====
+struct SoundData {
+  float dB;
+  float bassLevel;    // 20-250 Hz (magnitude)
+  float midLevel;     // 250-2000 Hz (magnitude)
+  float trebleLevel;  // 2000-8000 Hz (magnitude)
+  float dominantFreq; // Tần số mạnh nhất
+};
+
+SoundData soundData;
+
+// ==== FFT ====
+ArduinoFFT<double> FFT = ArduinoFFT<double>();
+double vReal[SAMPLES];
+double vImag[SAMPLES];
+
+void setupI2S() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false
+  };
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+double calculateRMS(int32_t *data, int samples) {
+  double mean = 0;
+  for (int i = 0; i < samples; i++) mean += data[i];
+  mean /= samples;
+  double sum = 0;
+  for (int i = 0; i < samples; i++) {
+    double x = (data[i] - mean) / 2147483648.0;
+    sum += x * x;
+  }
+  return sqrt(sum / samples);
+}
+
+// ==== Phân tích FFT ====
+void analyzeFFT(int32_t *buffer) {
+  // Chuẩn bị dữ liệu cho FFT
+  for (int i = 0; i < SAMPLES; i++) {
+    vReal[i] = (double)buffer[i] / 2147483648.0; // Normalize
+    vImag[i] = 0;
+  }
+
+  // Thực hiện FFT
+  FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  FFT.complexToMagnitude(vReal, vImag, SAMPLES);
+
+  // Tính độ phân giải tần số
+  double freqResolution = (double)SAMPLE_RATE / SAMPLES; // ~31.25 Hz
+
+  // ==== Phân tích các dải tần ====
+  double bassSum = 0, midSum = 0, trebleSum = 0;
+  int bassCount = 0, midCount = 0, trebleCount = 0;
+
+  double maxMagnitude = 0;
+  int maxIndex = 0;
+
+  for (int i = 1; i < SAMPLES / 2; i++) { // Bỏ DC component (i=0)
+    double freq = i * freqResolution;
+    double magnitude = vReal[i];
+
+    // Tìm tần số mạnh nhất
+    if (magnitude > maxMagnitude) {
+      maxMagnitude = magnitude;
+      maxIndex = i;
+    }
+
+    // Phân loại theo dải tần
+    if (freq >= 20 && freq < 250) {
+      bassSum += magnitude;
+      bassCount++;
+    } else if (freq >= 250 && freq < 2000) {
+      midSum += magnitude;
+      midCount++;
+    } else if (freq >= 2000 && freq < 8000) {
+      trebleSum += magnitude;
+      trebleCount++;
+    }
+  }
+
+  // Tính trung bình (GIỮ NGUYÊN MAGNITUDE - KHÔNG CHUYỂN SANG dB)
+  soundData.bassLevel = bassCount > 0 ? (bassSum / bassCount) : 0;
+  soundData.midLevel = midCount > 0 ? (midSum / midCount) : 0;
+  soundData.trebleLevel = trebleCount > 0 ? (trebleSum / trebleCount) : 0;
+  soundData.dominantFreq = maxIndex * freqResolution;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n╔════════════════════════════════════════════════╗");
+  Serial.println("║   🔊 ESP32-C3 + INMP441 + FFT (MONITOR)      ║");
+  Serial.println("╚════════════════════════════════════════════════╝\n");
+  
+  setupI2S();
+  
+  Serial.println("✅ I2S sẵn sàng");
+  Serial.println("🎤 Bắt đầu đo âm thanh...\n");
+}
+
+void loop() {
+  size_t bytes_read;
+  int32_t buffer[SAMPLES];
+  
+  // Đọc dữ liệu từ mic
+  i2s_read(I2S_NUM_0, (void*)buffer, sizeof(buffer), &bytes_read, portMAX_DELAY);
+
+  // Tính tổng dB (RMS)
+  double rms = calculateRMS(buffer, SAMPLES);
+  if (rms < 0.0000001) rms = 0.0000001;
+  soundData.dB = 20 * log10(rms) + 94;
+
+  // Phân tích FFT
+  analyzeFFT(buffer);
+
+  // In thông tin
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.printf("📊 Tổng dB: %.1f\n", soundData.dB);
+  Serial.printf("🎸 Bass:   %.6f (20-250Hz)\n", soundData.bassLevel);
+  Serial.printf("🎤 Mid:    %.6f (250-2kHz)\n", soundData.midLevel);
+  Serial.printf("🎺 Treble: %.6f (2k-8kHz)\n", soundData.trebleLevel);
+  Serial.printf("🎵 Dominant: %.0f Hz\n\n", soundData.dominantFreq);
+  
+  delay(200);
+}
