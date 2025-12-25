@@ -1,38 +1,37 @@
 /*
-  === ESP32-C3 Super Mini + INMP441 + FFT (Monitor Mode) ===
-  🎵 Đo và hiển thị Bass/Mid/Treble + dB lên Serial Monitor
-  🔌 PIN: WS=4, SD=5, SCK=6
-  
-  ✅ Không gửi ESP-NOW - Chỉ đo và in ra
+  === ESP32-C3 + INMP441 - Voice Activity Detection (VAD) ===
+  Features tối ưu cho nhận diện giọng nói
 */
 
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
 
-// ==== PIN cho ESP32-C3 Super Mini ====
-#define I2S_WS  4   // GPIO4 - LRCLK/WS
-#define I2S_SD  5   // GPIO5 - DOUT/SD (Data)
-#define I2S_SCK 6   // GPIO6 - BCLK/SCK
+#define I2S_WS  4
+#define I2S_SD  5
+#define I2S_SCK 6
 
 #define SAMPLE_RATE 16000
-#define SAMPLES 512  // FFT samples (phải là lũy thừa của 2)
+#define SAMPLES 512
 
-// ==== Cấu trúc dữ liệu đo ====
-struct SoundData {
-  float dB;
-  float bassLevel;    // 20-250 Hz (magnitude)
-  float midLevel;     // 250-2000 Hz (magnitude)
-  float trebleLevel;  // 2000-8000 Hz (magnitude)
-  float dominantFreq; // Tần số mạnh nhất
-};
-
-SoundData soundData;
-
-// ==== FFT ====
 ArduinoFFT<double> FFT = ArduinoFFT<double>();
 double vReal[SAMPLES];
 double vImag[SAMPLES];
+
+// Features cho Voice Detection
+struct VoiceFeatures {
+  float dB;                // Âm lượng tổng
+  float energy;            // Năng lượng tín hiệu
+  float zcr;               // Zero Crossing Rate (đặc trưng giọng nói)
+  float spectralCentroid;  // Trọng tâm phổ tần
+  float voiceBand;         // 300-3400 Hz (dải tần giọng nói)
+  float lowFreq;           // 85-255 Hz (fundamental frequency)
+  float highFreq;          // 3400-8000 Hz
+  float spectralFlux;      // Biến thiên phổ
+};
+
+VoiceFeatures features;
+double prevSpectrum[SAMPLES/2];
 
 void setupI2S() {
   i2s_config_t i2s_config = {
@@ -57,6 +56,28 @@ void setupI2S() {
   i2s_zero_dma_buffer(I2S_NUM_0);
 }
 
+// Tính Zero Crossing Rate (cao = noise, trung bình = giọng nói)
+float calculateZCR(int32_t *data, int samples) {
+  int zeroCrossings = 0;
+  for (int i = 1; i < samples; i++) {
+    if ((data[i] >= 0 && data[i-1] < 0) || (data[i] < 0 && data[i-1] >= 0)) {
+      zeroCrossings++;
+    }
+  }
+  return (float)zeroCrossings / samples;
+}
+
+// Tính năng lượng
+float calculateEnergy(int32_t *data, int samples) {
+  double sum = 0;
+  for (int i = 0; i < samples; i++) {
+    double x = (double)data[i] / 2147483648.0;
+    sum += x * x;
+  }
+  return sum / samples;
+}
+
+// Tính RMS cho dB
 double calculateRMS(int32_t *data, int samples) {
   double mean = 0;
   for (int i = 0; i < samples; i++) mean += data[i];
@@ -69,88 +90,107 @@ double calculateRMS(int32_t *data, int samples) {
   return sqrt(sum / samples);
 }
 
-// ==== Phân tích FFT ====
-void analyzeFFT(int32_t *buffer) {
-  // Chuẩn bị dữ liệu cho FFT
+// Phân tích FFT cho Voice Detection
+void analyzeVoiceFFT(int32_t *buffer) {
+  // Chuẩn bị FFT
   for (int i = 0; i < SAMPLES; i++) {
-    vReal[i] = (double)buffer[i] / 2147483648.0; // Normalize
+    vReal[i] = (double)buffer[i] / 2147483648.0;
     vImag[i] = 0;
   }
 
-  // Thực hiện FFT
   FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
   FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
   FFT.complexToMagnitude(vReal, vImag, SAMPLES);
 
-  // Tính độ phân giải tần số
-  double freqResolution = (double)SAMPLE_RATE / SAMPLES; // ~31.25 Hz
+  double freqResolution = (double)SAMPLE_RATE / SAMPLES;
+  
+  // Reset
+  double voiceSum = 0, lowSum = 0, highSum = 0;
+  int voiceCount = 0, lowCount = 0, highCount = 0;
+  double totalMagnitude = 0;
+  double weightedFreq = 0;
+  double spectralFlux = 0;
 
-  // ==== Phân tích các dải tần ====
-  double bassSum = 0, midSum = 0, trebleSum = 0;
-  int bassCount = 0, midCount = 0, trebleCount = 0;
-
-  double maxMagnitude = 0;
-  int maxIndex = 0;
-
-  for (int i = 1; i < SAMPLES / 2; i++) { // Bỏ DC component (i=0)
+  for (int i = 1; i < SAMPLES / 2; i++) {
     double freq = i * freqResolution;
     double magnitude = vReal[i];
+    
+    totalMagnitude += magnitude;
+    weightedFreq += freq * magnitude;
+    
+    // Spectral Flux (so sánh với frame trước)
+    spectralFlux += fabs(magnitude - prevSpectrum[i]);
+    prevSpectrum[i] = magnitude;
 
-    // Tìm tần số mạnh nhất
-    if (magnitude > maxMagnitude) {
-      maxMagnitude = magnitude;
-      maxIndex = i;
+    // Dải tần giọng nói (300-3400 Hz - telephone bandwidth)
+    if (freq >= 300 && freq < 3400) {
+      voiceSum += magnitude;
+      voiceCount++;
     }
-
-    // Phân loại theo dải tần
-    if (freq >= 20 && freq < 250) {
-      bassSum += magnitude;
-      bassCount++;
-    } else if (freq >= 250 && freq < 2000) {
-      midSum += magnitude;
-      midCount++;
-    } else if (freq >= 2000 && freq < 8000) {
-      trebleSum += magnitude;
-      trebleCount++;
+    
+    // Fundamental frequency (85-255 Hz - pitch của giọng nói)
+    if (freq >= 85 && freq < 255) {
+      lowSum += magnitude;
+      lowCount++;
+    }
+    
+    // High frequency
+    if (freq >= 3400 && freq < 8000) {
+      highSum += magnitude;
+      highCount++;
     }
   }
 
-  // Tính trung bình (GIỮ NGUYÊN MAGNITUDE - KHÔNG CHUYỂN SANG dB)
-  soundData.bassLevel = bassCount > 0 ? (bassSum / bassCount) : 0;
-  soundData.midLevel = midCount > 0 ? (midSum / midCount) : 0;
-  soundData.trebleLevel = trebleCount > 0 ? (trebleSum / trebleCount) : 0;
-  soundData.dominantFreq = maxIndex * freqResolution;
+  // Tính Spectral Centroid (trọng tâm phổ)
+  features.spectralCentroid = totalMagnitude > 0 ? (weightedFreq / totalMagnitude) : 0;
+  
+  features.voiceBand = voiceCount > 0 ? (voiceSum / voiceCount) : 0;
+  features.lowFreq = lowCount > 0 ? (lowSum / lowCount) : 0;
+  features.highFreq = highCount > 0 ? (highSum / highCount) : 0;
+  features.spectralFlux = spectralFlux / (SAMPLES / 2);
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  
+  // CSV Header cho Edge Impulse
+  Serial.println("timestamp,dB,energy,zcr,spectralCentroid,voiceBand,lowFreq,highFreq,spectralFlux");
+  
   setupI2S();
+  
+  // Khởi tạo prevSpectrum
+  for (int i = 0; i < SAMPLES/2; i++) prevSpectrum[i] = 0;
 }
 
 void loop() {
   size_t bytes_read;
   int32_t buffer[SAMPLES];
   
-  // Đọc dữ liệu từ mic
   i2s_read(I2S_NUM_0, (void*)buffer, sizeof(buffer), &bytes_read, portMAX_DELAY);
 
-  // Tính tổng dB (RMS)
+  // Tính các features
   double rms = calculateRMS(buffer, SAMPLES);
   if (rms < 0.0000001) rms = 0.0000001;
-  soundData.dB = 20 * log10(rms) + 94;
+  features.dB = 20 * log10(rms) + 94;
+  
+  features.energy = calculateEnergy(buffer, SAMPLES);
+  features.zcr = calculateZCR(buffer, SAMPLES);
+  
+  analyzeVoiceFFT(buffer);
 
-  // Phân tích FFT
-  analyzeFFT(buffer);
-
-  // In giá trị
-  Serial.printf("%.1f,%.6f,%.6f,%.6f,%.0f\n", 
-    soundData.dB,
-    soundData.bassLevel,
-    soundData.midLevel,
-    soundData.trebleLevel,
-    soundData.dominantFreq
+  // Output CSV format
+  Serial.printf("%lu,%.2f,%.6f,%.4f,%.2f,%.6f,%.6f,%.6f,%.6f\n", 
+    millis(),
+    features.dB,
+    features.energy,
+    features.zcr,
+    features.spectralCentroid,
+    features.voiceBand,
+    features.lowFreq,
+    features.highFreq,
+    features.spectralFlux
   );
   
-  delay(20);
+  delay(100);  // 10 samples/giây
 }
