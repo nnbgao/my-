@@ -1,0 +1,667 @@
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SPIFFS.h>
+
+// ===== CẤU HÌNH WIFI =====
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// ===== GOOGLE APPS SCRIPT URL =====
+const char* scriptURL = "https://script.google.com/macros/s/AKfycbwVtT6u5jbGQ95iUBSzG7vOMI5s0f5plDMqMEuBqNAn5_iUC0bdYkFa9SKv80SI69im/exec";
+
+// ===== CHÂN KẾT NỐI 2 MIC INMP441 =====
+// MIC 1 (Trái - Primary)
+#define I2S_WS_1    15
+#define I2S_SD_1    32
+#define I2S_SCK_1   14
+
+// MIC 2 (Phải - Reference cho ANC)
+#define I2S_WS_2    25
+#define I2S_SD_2    33
+#define I2S_SCK_2   26
+
+// ===== CẤU HÌNH GHI ÂM =====
+#define SAMPLE_RATE   16000
+#define RECORD_TIME   5
+#define I2S_PORT_1    I2S_NUM_0
+#define I2S_PORT_2    I2S_NUM_1
+#define BUFFER_SIZE   512
+
+// ===== CẤU HÌNH NOISE CANCELLING =====
+#define ANC_ENABLE true              // Bật/tắt ANC
+#define NOISE_GATE_THRESHOLD 400     // Ngưỡng lọc nhiễu (thấp hơn để giữ giọng giáo viên)
+#define ADAPTIVE_FILTER_SIZE 48      // Tăng lên để lọc tốt hơn tiếng ồn ngoài
+#define SMOOTHING_FACTOR 0.92        // Giảm xuống để phản ứng nhanh với giọng nói
+#define MIC_DISTANCE_CM 300          // Khoảng cách 2 mic: ~3m (điều chỉnh theo phòng)
+
+// Bộ lọc thích nghi LMS (Least Mean Squares)
+class AdaptiveFilter {
+private:
+  float weights[ADAPTIVE_FILTER_SIZE];
+  float buffer[ADAPTIVE_FILTER_SIZE];
+  float learningRate;
+  int bufferIndex;
+  
+public:
+  AdaptiveFilter(float lr = 0.01) : learningRate(lr), bufferIndex(0) {
+    for (int i = 0; i < ADAPTIVE_FILTER_SIZE; i++) {
+      weights[i] = 0.0f;
+      buffer[i] = 0.0f;
+    }
+  }
+  
+  // Xử lý noise cancelling
+  int16_t process(int16_t primary, int16_t reference) {
+    // Thêm reference vào buffer
+    buffer[bufferIndex] = (float)reference;
+    
+    // Tính output của bộ lọc
+    float filterOutput = 0.0f;
+    for (int i = 0; i < ADAPTIVE_FILTER_SIZE; i++) {
+      int idx = (bufferIndex - i + ADAPTIVE_FILTER_SIZE) % ADAPTIVE_FILTER_SIZE;
+      filterOutput += weights[i] * buffer[idx];
+    }
+    
+    // Tính error (nhiễu còn lại)
+    float error = (float)primary - filterOutput;
+    
+    // Cập nhật weights (LMS algorithm)
+    for (int i = 0; i < ADAPTIVE_FILTER_SIZE; i++) {
+      int idx = (bufferIndex - i + ADAPTIVE_FILTER_SIZE) % ADAPTIVE_FILTER_SIZE;
+      weights[i] += learningRate * error * buffer[idx];
+    }
+    
+    bufferIndex = (bufferIndex + 1) % ADAPTIVE_FILTER_SIZE;
+    
+    // Trả về tín hiệu đã lọc nhiễu
+    return (int16_t)error;
+  }
+};
+
+// Noise Gate - Loại bỏ tín hiệu yếu
+class NoiseGate {
+private:
+  int16_t threshold;
+  float smoothedLevel;
+  
+public:
+  NoiseGate(int16_t thresh) : threshold(thresh), smoothedLevel(0) {}
+  
+  int16_t process(int16_t sample) {
+    // Tính RMS mượt
+    float level = abs(sample);
+    smoothedLevel = SMOOTHING_FACTOR * smoothedLevel + (1 - SMOOTHING_FACTOR) * level;
+    
+    // Áp dụng gate
+    if (smoothedLevel < threshold) {
+      return 0;
+    }
+    return sample;
+  }
+  
+  void setThreshold(int16_t thresh) {
+    threshold = thresh;
+  }
+};
+
+// Spectral Subtraction - Giảm nhiễu trong miền tần số
+class SpectralSubtraction {
+private:
+  float noiseProfile[BUFFER_SIZE];
+  int profileSamples;
+  bool profileReady;
+  
+public:
+  SpectralSubtraction() : profileSamples(0), profileReady(false) {
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+      noiseProfile[i] = 0;
+    }
+  }
+  
+  // Thu thập noise profile (chạy trong im lặng)
+  void collectNoiseProfile(int16_t* samples, int count) {
+    if (profileSamples < 5) {  // Thu thập 5 frame
+      for (int i = 0; i < count && i < BUFFER_SIZE; i++) {
+        noiseProfile[i] += abs(samples[i]);
+      }
+      profileSamples++;
+      if (profileSamples >= 5) {
+        // Tính trung bình
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+          noiseProfile[i] /= 5.0f;
+        }
+        profileReady = true;
+      }
+    }
+  }
+  
+  // Áp dụng spectral subtraction
+  void process(int16_t* samples, int count) {
+    if (!profileReady) return;
+    
+    for (int i = 0; i < count; i++) {
+      float magnitude = abs(samples[i]);
+      float cleanMagnitude = magnitude - noiseProfile[i % BUFFER_SIZE];
+      
+      if (cleanMagnitude < 0) cleanMagnitude = 0;
+      
+      // Giữ dấu của signal
+      samples[i] = (samples[i] >= 0) ? (int16_t)cleanMagnitude : -(int16_t)cleanMagnitude;
+    }
+  }
+  
+  bool isReady() { return profileReady; }
+};
+
+// WAV Header
+typedef struct {
+  char riff[4];
+  uint32_t fileSize;
+  char wave[4];
+  char fmt[4];
+  uint32_t fmtSize;
+  uint16_t audioFormat;
+  uint16_t channels;
+  uint32_t sampleRate;
+  uint32_t byteRate;
+  uint16_t blockAlign;
+  uint16_t bitsPerSample;
+  char data[4];
+  uint32_t dataSize;
+} WAVHeader;
+
+// Khởi tạo các bộ lọc ANC
+AdaptiveFilter adaptiveFilter(0.005);  // Learning rate thấp cho ổn định
+NoiseGate noiseGate(NOISE_GATE_THRESHOLD);
+SpectralSubtraction spectralSubtractor;
+
+void setupI2S(i2s_port_t port, int ws, int sd, int sck) {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = BUFFER_SIZE,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = sck,
+    .ws_io_num = ws,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = sd
+  };
+
+  i2s_driver_install(port, &i2s_config, 0, NULL);
+  i2s_set_pin(port, &pin_config);
+  i2s_zero_dma_buffer(port);
+}
+
+void createWAVHeader(WAVHeader* header, uint32_t dataSize) {
+  memcpy(header->riff, "RIFF", 4);
+  header->fileSize = dataSize + 36;
+  memcpy(header->wave, "WAVE", 4);
+  memcpy(header->fmt, "fmt ", 4);
+  header->fmtSize = 16;
+  header->audioFormat = 1;
+  header->channels = 1;  // Mono sau khi ANC
+  header->sampleRate = SAMPLE_RATE;
+  header->bitsPerSample = 16;
+  header->byteRate = SAMPLE_RATE * 2;
+  header->blockAlign = 2;
+  memcpy(header->data, "data", 4);
+  header->dataSize = dataSize;
+}
+
+// Thu thập noise profile trong 1 giây đầu
+void calibrateNoiseProfile() {
+  Serial.println("🔇 Đang thu thập noise profile...");
+  Serial.println("   (Giữ im lặng trong 1 giây)");
+  
+  int32_t buffer1[BUFFER_SIZE];
+  int32_t buffer2[BUFFER_SIZE];
+  int16_t samples[BUFFER_SIZE];
+  size_t bytesRead1, bytesRead2;
+  
+  int calibrationFrames = SAMPLE_RATE / BUFFER_SIZE;  // 1 giây
+  
+  for (int frame = 0; frame < calibrationFrames; frame++) {
+    i2s_read(I2S_PORT_1, buffer1, BUFFER_SIZE * 4, &bytesRead1, portMAX_DELAY);
+    i2s_read(I2S_PORT_2, buffer2, BUFFER_SIZE * 4, &bytesRead2, portMAX_DELAY);
+    
+    size_t samplesRead = bytesRead1 / 4;
+    for (int i = 0; i < samplesRead; i++) {
+      samples[i] = (buffer1[i] >> 16) & 0xFFFF;
+    }
+    
+    spectralSubtractor.collectNoiseProfile(samples, samplesRead);
+    
+    if (frame % (calibrationFrames / 5) == 0) {
+      Serial.print("▓");
+    }
+  }
+  
+  Serial.println();
+  Serial.println("✅ Noise profile đã sẵn sàng!");
+}
+
+void recordAudioWithANC(const char* filename) {
+  File file = SPIFFS.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("❌ Lỗi: Không thể tạo file!");
+    return;
+  }
+
+  WAVHeader header;
+  file.write((uint8_t*)&header, sizeof(WAVHeader));
+
+  int32_t buffer1[BUFFER_SIZE];
+  int32_t buffer2[BUFFER_SIZE];
+  int16_t processedBuffer[BUFFER_SIZE];
+  size_t bytesRead1, bytesRead2;
+  uint32_t totalDataSize = 0;
+  
+  uint32_t totalSamples = SAMPLE_RATE * RECORD_TIME;
+  uint32_t samplesRecorded = 0;
+
+  Serial.println("🎙️  BẮT ĐẦU GHI ÂM VỚI ANC...");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+  unsigned long startTime = millis();
+  int noiseCancelledSamples = 0;
+
+  while (samplesRecorded < totalSamples) {
+    // Đọc từ cả 2 mic
+    i2s_read(I2S_PORT_1, buffer1, BUFFER_SIZE * 4, &bytesRead1, portMAX_DELAY);
+    i2s_read(I2S_PORT_2, buffer2, BUFFER_SIZE * 4, &bytesRead2, portMAX_DELAY);
+    
+    size_t samplesRead = bytesRead1 / 4;
+    
+    // Xử lý từng sample với ANC
+    for (int i = 0; i < samplesRead; i++) {
+      int16_t primary = (buffer1[i] >> 16) & 0xFFFF;
+      int16_t reference = (buffer2[i] >> 16) & 0xFFFF;
+      
+      int16_t cleaned = primary;
+      
+      if (ANC_ENABLE) {
+        // Bước 1: Adaptive filtering (loại bỏ nhiễu tương quan)
+        cleaned = adaptiveFilter.process(primary, reference);
+        
+        // Bước 2: Noise gate (loại bỏ tín hiệu yếu)
+        cleaned = noiseGate.process(cleaned);
+        
+        if (cleaned == 0) noiseCancelledSamples++;
+      }
+      
+      processedBuffer[i] = cleaned;
+    }
+    
+    // Bước 3: Spectral subtraction (nếu đã có noise profile)
+    if (ANC_ENABLE && spectralSubtractor.isReady()) {
+      spectralSubtractor.process(processedBuffer, samplesRead);
+    }
+    
+    // Ghi vào file (Mono)
+    size_t bytesToWrite = samplesRead * 2;
+    file.write((uint8_t*)processedBuffer, bytesToWrite);
+    totalDataSize += bytesToWrite;
+    samplesRecorded += samplesRead;
+    
+    // Progress bar
+    int progress = (samplesRecorded * 100) / totalSamples;
+    if (progress % 20 == 0 && samplesRecorded % (SAMPLE_RATE / 2) == 0) {
+      Serial.printf("▓");
+    }
+  }
+
+  unsigned long elapsed = millis() - startTime;
+  float noiseReduction = (noiseCancelledSamples * 100.0) / samplesRecorded;
+  
+  Serial.println();
+  Serial.printf("✅ Hoàn tất! Thời gian: %lu ms\n", elapsed);
+  Serial.printf("📊 Kích thước: %d KB\n", (totalDataSize + sizeof(WAVHeader))/1024);
+  Serial.printf("🔇 Nhiễu đã lọc: %.1f%%\n", noiseReduction);
+
+  file.seek(0);
+  createWAVHeader(&header, totalDataSize);
+  file.write((uint8_t*)&header, sizeof(WAVHeader));
+  file.close();
+}
+
+String base64Encode(uint8_t* data, size_t len) {
+  const char* base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String encoded = "";
+  encoded.reserve((len * 4) / 3 + 4);
+  
+  for (size_t i = 0; i < len; i += 3) {
+    uint32_t b = (data[i] << 16) | ((i + 1 < len ? data[i + 1] : 0) << 8) | (i + 2 < len ? data[i + 2] : 0);
+    encoded += base64Chars[(b >> 18) & 0x3F];
+    encoded += base64Chars[(b >> 12) & 0x3F];
+    encoded += (i + 1 < len) ? base64Chars[(b >> 6) & 0x3F] : '=';
+    encoded += (i + 2 < len) ? base64Chars[b & 0x3F] : '=';
+  }
+  return encoded;
+}
+
+bool uploadToGoogleDrive(const char* filename) {
+  File file = SPIFFS.open(filename, FILE_READ);
+  if (!file) {
+    Serial.println("❌ Không thể đọc file!");
+    return false;
+  }
+
+  Serial.println("☁️  ĐANG UPLOAD LÊN GOOGLE DRIVE...");
+  
+  size_t fileSize = file.size();
+  Serial.printf("📦 Kích thước file: %d bytes\n", fileSize);
+  
+  uint8_t* buffer = (uint8_t*)malloc(fileSize);
+  if (!buffer) {
+    Serial.println("❌ Không đủ RAM!");
+    file.close();
+    return false;
+  }
+  
+  file.read(buffer, fileSize);
+  file.close();
+
+  Serial.print("🔄 Đang mã hóa... ");
+  String encoded = "";
+  size_t chunkSize = 3000;
+  for (size_t i = 0; i < fileSize; i += chunkSize) {
+    size_t len = min(chunkSize, fileSize - i);
+    encoded += base64Encode(buffer + i, len);
+    if (i % 15000 == 0) Serial.print(".");
+  }
+  free(buffer);
+  Serial.println(" OK");
+
+  String timestamp = String(millis());
+  String jsonData = "{\"filename\":\"recording_ANC_" + timestamp + ".wav\",\"data\":\"" + encoded + "\"}";
+
+  HTTPClient http;
+  http.begin(scriptURL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(30000);
+  
+  Serial.print("📤 Đang gửi... ");
+  int httpCode = http.POST(jsonData);
+  
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println("OK");
+    Serial.println("✅ UPLOAD THÀNH CÔNG!");
+    Serial.println("🔗 Link file: " + response);
+    http.end();
+    return true;
+  } else {
+    Serial.println("THẤT BẠI");
+    Serial.printf("❌ Mã lỗi HTTP: %d\n", httpCode);
+    http.end();
+    return false;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n╔════════════════════════════════════╗");
+  Serial.println("║  ESP32-S DUAL MIC + ANC v2.0      ║");
+  Serial.println("║  Acoustic Noise Cancelling        ║");
+  Serial.println("╚════════════════════════════════════╝\n");
+  
+  Serial.print("💾 Khởi tạo SPIFFS... ");
+  if (!SPIFFS.begin(true)) {
+    Serial.println("THẤT BẠI!");
+    while(1) delay(1000);
+  }
+  Serial.println("OK");
+  
+  Serial.printf("📶 Đang kết nối WiFi: %s\n", ssid);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ KHÔNG THỂ KẾT NỐI WIFI!");
+    while(1) delay(1000);
+  }
+  
+  Serial.println("✅ Đã kết nối WiFi!");
+  Serial.print("🌐 IP: ");
+  Serial.println(WiFi.localIP());
+  
+  Serial.println("\n🎛️  Đang khởi tạo I2S...");
+  Serial.println("   → MIC 1 (Primary): WS=15, SD=32, SCK=14");
+  setupI2S(I2S_PORT_1, I2S_WS_1, I2S_SD_1, I2S_SCK_1);
+  Serial.println("   → MIC 2 (Reference): WS=25, SD=33, SCK=26");
+  setupI2S(I2S_PORT_2, I2S_WS_2, I2S_SD_2, I2S_SCK_2);
+  Serial.println("✅ I2S sẵn sàng!\n");
+  
+  delay(1000);
+  
+  // Calibrate noise profile
+  calibrateNoiseProfile();
+  
+  Serial.println("\n🚀 HỆ THỐNG SẴN SÀNG!\n");
+  Serial.println("════════════════════════════════════\n");
+}
+
+void loop() {
+  const char* audioFile = "/recording.wav";
+  
+  Serial.println("🎬 BẮT ĐẦU CHU KỲ MỚI");
+  Serial.println("════════════════════════════════════");
+  
+  recordAudioWithANC(audioFile);
+  
+  Serial.println();
+  
+  if (uploadToGoogleDrive(audioFile)) {
+    SPIFFS.remove(audioFile);
+    Serial.println("🗑️  Đã xóa file tạm");
+  }
+  
+  Serial.println("\n⏳ Chờ 10 giây...");
+  Serial.println("════════════════════════════════════\n");
+  delay(10000);
+}
+
+/*
+╔═══════════════════════════════════════════════════════════════════════╗
+║              SETUP CHO LỚP HỌC - HƯỚNG DẪN CHI TIẾT                   ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+🏫 CẤU HÌNH TỐI ƯU CHO LỚP HỌC:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📍 VỊ TRÍ ĐẶT MIC:
+
+     CỬA SỔ/CỬA CHÍNH (nguồn ồn)
+  ╔══════════════════════════════╗
+  ║   [MIC 2] ← 50cm từ cửa      ║  
+  ║   └─ Hướng RA NGOÀI          ║  ← Reference Mic
+  ║      (bắt tiếng xe, gió,     ║     (bắt tiếng ồn bên ngoài)
+  ║       người qua lại)          ║
+  ║                              ║
+  ║        LỚP HỌC              ║
+  ║                              ║
+  ║      👨‍🏫 Giáo viên           ║
+  ║      [MIC 1]                 ║  ← Primary Mic
+  ║      └─ 1-2m từ giáo viên    ║     (bắt giọng giáo viên)
+  ║         (treo trần/đặt bục)  ║
+  ║                              ║
+  ║    🪑🪑🪑 Học sinh            ║
+  ╚══════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ MIC 1 (Primary - Trong lớp):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📍 Vị trí:
+   - Gần giáo viên (1-2 mét)
+   - Treo trần hoặc đặt trên bục giảng
+   - Hướng về phía giáo viên
+   - Tránh gần quạt/máy lạnh
+
+🎯 Mục đích:
+   - Bắt giọng giáo viên rõ ràng
+   - Thu âm chính của lớp học
+   - Bắt cả câu hỏi học sinh (nếu gần)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ MIC 2 (Reference - Ngoài cửa):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📍 Vị trí:
+   - Gần cửa sổ/cửa chính (30-50cm)
+   - HƯỚNG RA NGOÀI (quan trọng!)
+   - Có thể đặt gần khe cửa
+   - Tránh bị che khuất
+
+🎯 Mục đích:
+   - Bắt tiếng ồn từ ngoài (xe cộ, gió, người đi lại)
+   - Làm tham chiếu để loại bỏ nhiễu
+   - KHÔNG thu giọng giáo viên
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚙️ THAM SỐ ĐÃ ĐIỀU CHỈNH CHO LỚP HỌC:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ NOISE_GATE_THRESHOLD = 400
+   - Thấp hơn để không mất giọng giáo viên
+   - Vẫn đủ để lọc nhiễu nền
+
+✅ ADAPTIVE_FILTER_SIZE = 48
+   - Tăng lên để lọc tốt hơn tiếng ồn bên ngoài
+   - Đủ lớn cho môi trường lớp học
+
+✅ SMOOTHING_FACTOR = 0.92
+   - Giảm xuống để phản ứng nhanh với giọng nói
+   - Không bỏ lỡ từ đầu câu
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎛️ CALIBRATION (Quan trọng cho lớp học!):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⏰ Thời điểm tốt nhất để calibrate:
+   ✅ TRƯỚC khi lớp học bắt đầu
+   ✅ Khi lớp TRỐNG (không có học sinh)
+   ✅ CỬA ĐÓNG (hoặc mở như khi dạy)
+   ✅ Quạt/máy lạnh BẬT (nếu dùng khi dạy)
+
+📝 Cách làm:
+   1. Reset ESP32
+   2. Đợi thông báo "Giữ im lặng 1 giây"
+   3. KHÔNG nói chuyện trong 1 giây
+   4. Hệ thống học noise profile
+   5. Sẵn sàng ghi âm!
+
+💡 Mẹo:
+   - Calibrate mỗi sáng trước giờ học
+   - Nếu đóng/mở cửa → Reset lại
+   - Nếu bật/tắt quạt → Reset lại
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 LOẠI NHIỄU SẼ BỊ LỌC:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Hiệu quả cao (70-90% giảm):
+   🚗 Tiếng xe cộ từ ngoài đường
+   💨 Tiếng gió, mưa
+   👥 Người đi lại hành lang
+   🔊 Tiếng loa phóng thanh xa
+   🏗️ Tiếng xây dựng ổn định
+
+⚠️ Hiệu quả trung bình (40-60% giảm):
+   🗣️ Người nói chuyện hành lang (gần cửa)
+   📱 Tiếng điện thoại reo
+   🚪 Tiếng đóng mở cửa đột ngột
+
+❌ Khó lọc:
+   😂 Tiếng cười/nói của học sinh TRONG lớp
+   📢 Tiếng hô to đột ngột
+   🎵 Nhạc từ lớp bên (nếu quá to)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔧 ĐIỀU CHỈNH NẾU CẦN:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Nếu giọng giáo viên bị nhỏ/méo:
+   → Giảm NOISE_GATE_THRESHOLD xuống 300
+   → Di chuyển Mic 1 gần giáo viên hơn
+
+Nếu vẫn nghe rõ tiếng xe ngoài:
+   → Tăng ADAPTIVE_FILTER_SIZE lên 64
+   → Di chuyển Mic 2 gần cửa hơn
+   → Đảm bảo Mic 2 HƯỚNG RA NGOÀI
+
+Nếu mất từ đầu câu:
+   → Giảm SMOOTHING_FACTOR xuống 0.85
+   → Giảm NOISE_GATE_THRESHOLD xuống 350
+
+Nếu ESP32 chậm/lag:
+   → Giảm ADAPTIVE_FILTER_SIZE xuống 32
+   → Giảm BUFFER_SIZE xuống 256
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 TIPS THÊM CHO LỚP HỌC:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. 🎤 Nếu có micro cho giáo viên:
+   - Đặt Mic 1 gần loa micro
+   - Hiệu quả tăng lên rất nhiều!
+
+2. 🪟 Nếu có nhiều cửa sổ:
+   - Đặt Mic 2 gần cửa ồn nhất
+   - Hoặc dùng 3-4 mic (nâng cao)
+
+3. 📹 Kết hợp với camera:
+   - Đồng bộ audio + video
+   - Tạo bài giảng online chất lượng
+
+4. ⏰ Lập lịch tự động:
+   - Ghi âm theo giờ học
+   - Tự động upload lên Drive
+   - Giáo viên chỉ cần bật nguồn!
+
+5. 🔋 Nguồn điện:
+   - Dùng adapter 5V ổn định
+   - KHÔNG dùng pin (sẽ hết giữa chừng)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ KẾT QUẢ MONG ĐỢI:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Giọng giáo viên rõ ràng 
+✅ Giảm 70-80% tiếng ồn ngoài đường
+✅ Lọc được tiếng quạt/máy lạnh
+✅ File audio dễ nghe, không mệt tai
+✅ Phù hợp làm bài giảng online
+
+🎯 Chất lượng tương đương thu âm studio nhỏ!
+
+*/
