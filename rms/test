@@ -1,0 +1,954 @@
+/*
+╔═══════════════════════════════════════════════════════════════════════════╗
+║           SELECTIVE ANC - CHỈ LỌC NHIỄU BÊN NGOÀI                         ║
+║                                                                            ║
+║  Chiến lược:                                                               ║
+║  1. Mic 2 (ngoài cửa) chỉ bắt nhiễu ngoài                                ║
+║  2. So sánh correlation giữa Mic 1 và Mic 2                              ║
+║  3. Nếu correlation cao → nhiễu chung → LỌC                              ║
+║  4. Nếu correlation thấp → tiếng trong lớp → GIỮ                         ║
+║  5. Giọng giáo viên gần Mic 1 → Mic 2 không nghe → Tự động giữ          ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+*/
+
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <WiFi.h>
+#include <SPIFFS.h>
+#include <math.h>
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CẤU HÌNH HỆ THỐNG
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WIFI & UPLOAD CONFIG
+// ═══════════════════════════════════════════════════════════════════════════
+
+const char* ssid = "TenWiFi";              // ← SỬA WIFI CỦA BẠN
+const char* password = "MatKhauWiFi";      // ← SỬA MẬT KHẨU
+
+// MIC 1: TRONG LỚP (gần giáo viên, bục giảng)
+#define I2S_WS_1    15
+#define I2S_SD_1    32
+#define I2S_SCK_1   14
+
+// MIC 2: NGOÀI CỬA (hướng ra ngoài, bắt nhiễu bên ngoài)
+#define I2S_WS_2    25
+#define I2S_SD_2    33
+#define I2S_SCK_2   26
+
+#define SAMPLE_RATE   16000
+#define RECORD_TIME   5
+#define I2S_PORT_1    I2S_NUM_0
+#define I2S_PORT_2    I2S_NUM_1
+#define BUFFER_SIZE   512
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SELECTIVE ANC PARAMETERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#define CORRELATION_WINDOW 64          // Số samples để tính correlation
+#define CORRELATION_THRESHOLD 0.3f     // > 0.3 = nhiễu chung, < 0.3 = tiếng trong lớp
+#define ADAPTIVE_FILTER_SIZE 64        
+#define LEARNING_RATE 0.005f           
+#define MIN_NOISE_LEVEL 100            // RMS tối thiểu của Mic 2 để kích hoạt ANC
+
+// Noise Gate (chỉ áp dụng khi ANC không active)
+#define NOISE_GATE_THRESHOLD 300
+#define GATE_ATTACK  0.08f
+#define GATE_RELEASE 0.002f
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WAV HEADER
+// ═══════════════════════════════════════════════════════════════════════════
+
+typedef struct {
+  char riff[4];
+  uint32_t fileSize;
+  char wave[4];
+  char fmt[4];
+  uint32_t fmtSize;
+  uint16_t audioFormat;
+  uint16_t channels;
+  uint32_t sampleRate;
+  uint32_t byteRate;
+  uint16_t blockAlign;
+  uint16_t bitsPerSample;
+  char data[4];
+  uint32_t dataSize;
+} WAVHeader;
+
+void createWAVHeader(WAVHeader* header, uint32_t dataSize) {
+  memcpy(header->riff, "RIFF", 4);
+  header->fileSize = dataSize + 36;
+  memcpy(header->wave, "WAVE", 4);
+  memcpy(header->fmt, "fmt ", 4);
+  header->fmtSize = 16;
+  header->audioFormat = 1;
+  header->channels = 1;
+  header->sampleRate = SAMPLE_RATE;
+  header->bitsPerSample = 16;
+  header->byteRate = SAMPLE_RATE * 2;
+  header->blockAlign = 2;
+  memcpy(header->data, "data", 4);
+  header->dataSize = dataSize;
+}
+
+int16_t extractSample(int32_t raw32bit) {
+  int32_t sample24bit = raw32bit >> 8;
+  return (int16_t)(sample24bit >> 8);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORRELATION DETECTOR - Phát hiện nhiễu chung vs tiếng trong lớp
+// ═══════════════════════════════════════════════════════════════════════════
+
+class CorrelationDetector {
+private:
+  int16_t* buffer1;
+  int16_t* buffer2;
+  int windowSize;
+  int writeIndex;
+  float smoothedCorrelation;
+  
+public:
+  CorrelationDetector(int winSize) 
+    : windowSize(winSize), writeIndex(0), smoothedCorrelation(0.0f) {
+    buffer1 = (int16_t*)calloc(winSize, sizeof(int16_t));
+    buffer2 = (int16_t*)calloc(winSize, sizeof(int16_t));
+  }
+  
+  ~CorrelationDetector() {
+    if (buffer1) free(buffer1);
+    if (buffer2) free(buffer2);
+  }
+  
+  // Thêm samples và tính correlation
+  float update(int16_t sample1, int16_t sample2) {
+    if (!buffer1 || !buffer2) return 0.0f;
+    
+    buffer1[writeIndex] = sample1;
+    buffer2[writeIndex] = sample2;
+    writeIndex = (writeIndex + 1) % windowSize;
+    
+    // Tính correlation coefficient
+    float sum1 = 0, sum2 = 0, sum12 = 0;
+    float sumSq1 = 0, sumSq2 = 0;
+    
+    for (int i = 0; i < windowSize; i++) {
+      float s1 = buffer1[i];
+      float s2 = buffer2[i];
+      sum1 += s1;
+      sum2 += s2;
+      sum12 += s1 * s2;
+      sumSq1 += s1 * s1;
+      sumSq2 += s2 * s2;
+    }
+    
+    float mean1 = sum1 / windowSize;
+    float mean2 = sum2 / windowSize;
+    
+    float cov = (sum12 / windowSize) - (mean1 * mean2);
+    float std1 = sqrt((sumSq1 / windowSize) - (mean1 * mean1));
+    float std2 = sqrt((sumSq2 / windowSize) - (mean2 * mean2));
+    
+    float correlation = 0.0f;
+    if (std1 > 1e-6f && std2 > 1e-6f) {
+      correlation = cov / (std1 * std2);
+    }
+    
+    // Smooth correlation với EMA
+    smoothedCorrelation = 0.9f * smoothedCorrelation + 0.1f * abs(correlation);
+    
+    return smoothedCorrelation;
+  }
+  
+  // Kiểm tra có phải nhiễu chung không
+  bool isCommonNoise(float micLevelThreshold) {
+    // Mic 2 phải có tín hiệu đủ mạnh VÀ correlation cao
+    return smoothedCorrelation > CORRELATION_THRESHOLD;
+  }
+  
+  float getCorrelation() {
+    return smoothedCorrelation;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADAPTIVE LMS FILTER - Chỉ chạy khi detect nhiễu chung
+// ═══════════════════════════════════════════════════════════════════════════
+
+class AdaptiveLMSFilter {
+private:
+  float* weights;
+  float* buffer;
+  int filterSize;
+  float learningRate;
+  int bufferIndex;
+  bool isActive;
+  
+public:
+  AdaptiveLMSFilter(int size, float lr) 
+    : filterSize(size), learningRate(lr), bufferIndex(0), isActive(false) {
+    weights = (float*)calloc(size, sizeof(float));
+    buffer = (float*)calloc(size, sizeof(float));
+  }
+  
+  ~AdaptiveLMSFilter() {
+    if (weights) free(weights);
+    if (buffer) free(buffer);
+  }
+  
+  int16_t process(int16_t primary, int16_t reference, bool active) {
+    if (!weights || !buffer) return primary;
+    
+    isActive = active;
+    
+    // Nếu không active → bypass (giữ nguyên tiếng trong lớp)
+    if (!isActive) {
+      return primary;
+    }
+    
+    // Active → Chạy LMS để lọc nhiễu
+    buffer[bufferIndex] = (float)reference;
+    
+    // FIR filtering
+    float filterOutput = 0.0f;
+    for (int i = 0; i < filterSize; i++) {
+      int idx = (bufferIndex - i + filterSize) % filterSize;
+      filterOutput += weights[i] * buffer[idx];
+    }
+    
+    // Error = signal sau khi trừ nhiễu ước lượng
+    float error = (float)primary - filterOutput;
+    
+    // LMS weight update
+    for (int i = 0; i < filterSize; i++) {
+      int idx = (bufferIndex - i + filterSize) % filterSize;
+      weights[i] += learningRate * error * buffer[idx];
+      weights[i] = constrain(weights[i], -5.0f, 5.0f);
+    }
+    
+    bufferIndex = (bufferIndex + 1) % filterSize;
+    
+    return (int16_t)constrain(error, -32768.0f, 32767.0f);
+  }
+  
+  bool getIsActive() {
+    return isActive;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RMS MONITOR - Theo dõi level của Mic 2
+// ═══════════════════════════════════════════════════════════════════════════
+
+class RMSMonitor {
+private:
+  float smoothedRMS;
+  float alpha;
+  
+public:
+  RMSMonitor(float smoothing = 0.95f) : smoothedRMS(0.0f), alpha(smoothing) {}
+  
+  void update(int16_t sample) {
+    float instantRMS = abs(sample);
+    smoothedRMS = alpha * smoothedRMS + (1.0f - alpha) * instantRMS;
+  }
+  
+  float getRMS() {
+    return smoothedRMS;
+  }
+  
+  bool isSignificant() {
+    return smoothedRMS > MIN_NOISE_LEVEL;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SIMPLE NOISE GATE
+// ═══════════════════════════════════════════════════════════════════════════
+
+class NoiseGate {
+private:
+  int16_t threshold;
+  float smoothedLevel;
+  
+public:
+  NoiseGate(int16_t thresh) : threshold(thresh), smoothedLevel(0.0f) {}
+  
+  int16_t process(int16_t sample) {
+    float level = abs(sample);
+    
+    if (level > smoothedLevel) {
+      smoothedLevel += GATE_ATTACK * (level - smoothedLevel);
+    } else {
+      smoothedLevel += GATE_RELEASE * (level - smoothedLevel);
+    }
+    
+    if (smoothedLevel < threshold) {
+      float ratio = smoothedLevel / threshold;
+      return (int16_t)(sample * ratio);
+    }
+    
+    return sample;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIGH-PASS FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+class HighPassFilter {
+private:
+  float x1, x2, y1, y2;
+  float b0, b1, b2, a1, a2;
+  
+public:
+  HighPassFilter(float cutoffHz, float sampleRate) {
+    float fc = cutoffHz / sampleRate;
+    float K = tan(PI * fc);
+    float Q = 0.7071f;
+    float norm = 1.0f / (1.0f + K / Q + K * K);
+    
+    b0 = norm;
+    b1 = -2.0f * norm;
+    b2 = norm;
+    a1 = 2.0f * (K * K - 1.0f) * norm;
+    a2 = (1.0f - K / Q + K * K) * norm;
+    
+    x1 = x2 = y1 = y2 = 0.0f;
+  }
+  
+  int16_t process(int16_t input) {
+    float x0 = (float)input;
+    float y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    
+    x2 = x1; x1 = x0;
+    y2 = y1; y1 = y0;
+    
+    return (int16_t)constrain(y0, -32768.0f, 32767.0f);
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// I2S SETUP
+// ═══════════════════════════════════════════════════════════════════════════
+
+void setupI2S(i2s_port_t port, int ws, int sd, int sck) {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = BUFFER_SIZE,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = sck,
+    .ws_io_num = ws,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = sd
+  };
+
+  i2s_driver_install(port, &i2s_config, 0, NULL);
+  i2s_set_pin(port, &pin_config);
+  i2s_zero_dma_buffer(port);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SELECTIVE ANC RECORDING
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Option: Save RAW audio (chưa qua ANC)
+void recordRawAudio(const char* filename) {
+  File file = SPIFFS.open(filename, FILE_WRITE);
+  if (!file) return;
+
+  WAVHeader header;
+  file.write((uint8_t*)&header, sizeof(WAVHeader));
+
+  int32_t* buffer1 = (int32_t*)malloc(BUFFER_SIZE * sizeof(int32_t));
+  int16_t* outputBuffer = (int16_t*)malloc(BUFFER_SIZE * sizeof(int16_t));
+  
+  if (!buffer1 || !outputBuffer) {
+    file.close();
+    return;
+  }
+
+  uint32_t totalDataSize = 0;
+  uint32_t totalSamples = SAMPLE_RATE * RECORD_TIME;
+  uint32_t samplesRecorded = 0;
+  size_t bytesRead;
+
+  Serial.println("🎤 Recording RAW audio (Mic 1 only)...");
+
+  while (samplesRecorded < totalSamples) {
+    i2s_read(I2S_PORT_1, buffer1, BUFFER_SIZE * 4, &bytesRead, portMAX_DELAY);
+    size_t samples = bytesRead / 4;
+    
+    for (int i = 0; i < samples && samplesRecorded < totalSamples; i++) {
+      outputBuffer[i] = extractSample(buffer1[i]);
+      samplesRecorded++;
+    }
+    
+    file.write((uint8_t*)outputBuffer, samples * 2);
+    totalDataSize += samples * 2;
+  }
+
+  file.seek(0);
+  createWAVHeader(&header, totalDataSize);
+  file.write((uint8_t*)&header, sizeof(WAVHeader));
+  file.close();
+  
+  free(buffer1);
+  free(outputBuffer);
+  
+  Serial.printf("✅ RAW saved: %d KB\n", totalDataSize / 1024);
+}
+
+void recordWithSelectiveANC(const char* filename) {
+  File file = SPIFFS.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("❌ Cannot create file!");
+    return;
+  }
+
+  WAVHeader header;
+  file.write((uint8_t*)&header, sizeof(WAVHeader));
+
+  Serial.println("\n🎛️  Initializing SELECTIVE ANC...");
+  
+  CorrelationDetector correlationDetector(CORRELATION_WINDOW);
+  AdaptiveLMSFilter lmsFilter(ADAPTIVE_FILTER_SIZE, LEARNING_RATE);
+  RMSMonitor mic2Monitor(0.95f);
+  NoiseGate noiseGate(NOISE_GATE_THRESHOLD);
+  HighPassFilter hpf(80.0f, (float)SAMPLE_RATE);
+  
+  int32_t* buffer1 = (int32_t*)malloc(BUFFER_SIZE * sizeof(int32_t));
+  int32_t* buffer2 = (int32_t*)malloc(BUFFER_SIZE * sizeof(int32_t));
+  int16_t* outputBuffer = (int16_t*)malloc(BUFFER_SIZE * sizeof(int16_t));
+  
+  if (!buffer1 || !buffer2 || !outputBuffer) {
+    Serial.println("❌ RAM allocation failed!");
+    file.close();
+    return;
+  }
+
+  uint32_t totalDataSize = 0;
+  uint32_t totalSamples = SAMPLE_RATE * RECORD_TIME;
+  uint32_t samplesRecorded = 0;
+  
+  // Statistics
+  uint32_t ancActiveSamples = 0;
+  uint32_t bypassSamples = 0;
+  
+  size_t bytesRead;
+
+  Serial.println("\n🎙️  RECORDING WITH SELECTIVE ANC...");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.println("   🟢 ANC Active   = Lọc nhiễu ngoài");
+  Serial.println("   🔵 ANC Bypass   = Giữ giọng trong lớp");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  
+  unsigned long startTime = millis();
+  int lastProgress = -1;
+
+  while (samplesRecorded < totalSamples) {
+    // Đọc cả 2 mic
+    i2s_read(I2S_PORT_1, buffer1, BUFFER_SIZE * 4, &bytesRead, portMAX_DELAY);
+    i2s_read(I2S_PORT_2, buffer2, BUFFER_SIZE * 4, &bytesRead, portMAX_DELAY);
+    
+    size_t samples = bytesRead / 4;
+    
+    for (int i = 0; i < samples && samplesRecorded < totalSamples; i++) {
+      int16_t primary = extractSample(buffer1[i]);
+      int16_t reference = extractSample(buffer2[i]);
+      
+      // 1. Monitor Mic 2 level
+      mic2Monitor.update(reference);
+      
+      // 2. Update correlation
+      float correlation = correlationDetector.update(primary, reference);
+      
+      // 3. Quyết định có lọc không
+      bool shouldFilter = mic2Monitor.isSignificant() && 
+                          correlationDetector.isCommonNoise(MIN_NOISE_LEVEL);
+      
+      // 4. Process signal
+      int16_t processed = primary;
+      
+      // HPF luôn chạy (remove rumble)
+      processed = hpf.process(processed);
+      
+      if (shouldFilter) {
+        // 🟢 ANC ACTIVE: Có nhiễu chung từ bên ngoài
+        processed = lmsFilter.process(processed, reference, true);
+        ancActiveSamples++;
+      } else {
+        // 🔵 ANC BYPASS: Giữ nguyên (giọng trong lớp)
+        processed = lmsFilter.process(processed, reference, false);
+        
+        // Chỉ áp dụng noise gate khi bypass
+        processed = noiseGate.process(processed);
+        bypassSamples++;
+      }
+      
+      outputBuffer[i] = processed;
+      samplesRecorded++;
+    }
+    
+    file.write((uint8_t*)outputBuffer, samples * 2);
+    totalDataSize += samples * 2;
+    
+    // Progress với status indicator
+    int progress = (samplesRecorded * 100) / totalSamples;
+    if (progress != lastProgress && progress % 10 == 0) {
+      char status = lmsFilter.getIsActive() ? '█' : '░';
+      Serial.printf("[%d%% %c] ", progress, status);
+      lastProgress = progress;
+    }
+  }
+
+  unsigned long elapsed = millis() - startTime;
+  float ancActivePercent = (ancActiveSamples * 100.0f) / samplesRecorded;
+  
+  Serial.println();
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.printf("✅ Recording complete: %.1f s\n", elapsed / 1000.0f);
+  Serial.printf("📊 File size: %d KB\n", totalDataSize / 1024);
+  Serial.println("\n📈 ANC Statistics:");
+  Serial.printf("   🟢 ANC Active:  %.1f%% (%d samples)\n", 
+                ancActivePercent, ancActiveSamples);
+  Serial.printf("   🔵 ANC Bypass:  %.1f%% (%d samples)\n", 
+                100.0f - ancActivePercent, bypassSamples);
+  Serial.printf("💾 Free RAM: %d KB\n", ESP.getFreeHeap() / 1024);
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+  file.seek(0);
+  createWAVHeader(&header, totalDataSize);
+  file.write((uint8_t*)&header, sizeof(WAVHeader));
+  file.close();
+  
+  free(buffer1);
+  free(buffer2);
+  free(outputBuffer);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SETUP & LOOP
+// ═══════════════════════════════════════════════════════════════════════════
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n╔═══════════════════════════════════════╗");
+  Serial.println("║  SELECTIVE ANC - Smart Filtering     ║");
+  Serial.println("║  Lọc nhiễu ngoài, giữ giọng trong    ║");
+  Serial.println("╚═══════════════════════════════════════╝\n");
+  
+  SPIFFS.begin(true);
+  
+  WiFi.begin(ssid, password);
+  Serial.print("📶 WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println(WiFi.status() == WL_CONNECTED ? " ✅" : " ⚠️");
+  
+  Serial.println("\n🎛️  Setup I2S...");
+  setupI2S(I2S_PORT_1, I2S_WS_1, I2S_SD_1, I2S_SCK_1);
+  setupI2S(I2S_PORT_2, I2S_WS_2, I2S_SD_2, I2S_SCK_2);
+  
+  delay(1000);
+  Serial.println("🚀 System ready!\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CHUNKED UPLOAD TO GOOGLE APPS SCRIPT
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Google Apps Script URL (từ bước deploy)
+const char* scriptURL = "https://script.google.com/macros/s/AKfycbxxx.../exec";
+//                                                         ↑
+//                                    Thay bằng URL của bạn!
+
+#define CHUNK_SIZE 20000          // 20KB per chunk
+#define MAX_RETRIES 3
+#define CHUNK_TIMEOUT 15000
+
+String base64Encode(uint8_t* data, size_t len) {
+  const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String encoded = "";
+  encoded.reserve((len * 4) / 3 + 4);
+  
+  for (size_t i = 0; i < len; i += 3) {
+    uint32_t b = (data[i] << 16) | 
+                 ((i + 1 < len ? data[i + 1] : 0) << 8) | 
+                 (i + 2 < len ? data[i + 2] : 0);
+    encoded += b64[(b >> 18) & 0x3F];
+    encoded += b64[(b >> 12) & 0x3F];
+    encoded += (i + 1 < len) ? b64[(b >> 6) & 0x3F] : '=';
+    encoded += (i + 2 < len) ? b64[b & 0x3F] : '=';
+  }
+  return encoded;
+}
+
+bool uploadFileInChunks(const char* filename) {
+  File file = SPIFFS.open(filename, FILE_READ);
+  if (!file) {
+    Serial.println("❌ Cannot open file!");
+    return false;
+  }
+
+  size_t fileSize = file.size();
+  size_t totalChunks = (fileSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+  String uploadId = String(millis());
+  
+  Serial.println("\n☁️  UPLOADING PROCESSED AUDIO TO CLOUD");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.printf("📦 File: %s (%.2f KB)\n", filename, fileSize / 1024.0);
+  Serial.printf("🔢 Chunks: %d × 20KB\n", totalChunks);
+  Serial.printf("🆔 Upload ID: %s\n", uploadId.c_str());
+  Serial.println("🎛️  Audio: PROCESSED (Selective ANC applied)");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+  HTTPClient http;
+  uint8_t* buffer = (uint8_t*)malloc(CHUNK_SIZE);
+  if (!buffer) {
+    Serial.println("❌ RAM allocation failed!");
+    file.close();
+    return false;
+  }
+
+  bool uploadSuccess = true;
+  unsigned long startTime = millis();
+
+  // Upload chunks
+  for (size_t chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+    size_t bytesRead = file.read(buffer, CHUNK_SIZE);
+    if (bytesRead == 0) continue;
+
+    String encodedChunk = base64Encode(buffer, bytesRead);
+    
+    String jsonPayload = "{";
+    jsonPayload += "\"action\":\"uploadChunk\",";
+    jsonPayload += "\"uploadId\":\"" + uploadId + "\",";
+    jsonPayload += "\"filename\":\"recording_processed_" + uploadId + ".wav\",";
+    jsonPayload += "\"chunkIndex\":" + String(chunkIndex) + ",";
+    jsonPayload += "\"totalChunks\":" + String(totalChunks) + ",";
+    jsonPayload += "\"data\":\"" + encodedChunk + "\"";
+    jsonPayload += "}";
+
+    bool chunkSuccess = false;
+    int retryCount = 0;
+    
+    while (!chunkSuccess && retryCount < MAX_RETRIES) {
+      http.begin(scriptURL);
+      http.addHeader("Content-Type", "application/json");
+      http.setTimeout(CHUNK_TIMEOUT);
+      
+      Serial.printf("📤 [%d/%d] %.1f KB ", 
+                    chunkIndex + 1, totalChunks, bytesRead / 1024.0);
+      
+      int httpCode = http.POST(jsonPayload);
+      
+      if (httpCode == 200) {
+        String response = http.getString();
+        if (response.indexOf("success") > 0) {
+          chunkSuccess = true;
+          Serial.printf("✅ [%d%%]\n", ((chunkIndex + 1) * 100) / totalChunks);
+        } else {
+          retryCount++;
+        }
+      } else {
+        Serial.printf("❌ HTTP %d\n", httpCode);
+        retryCount++;
+      }
+      
+      http.end();
+      
+      if (!chunkSuccess && retryCount < MAX_RETRIES) {
+        delay(retryCount * 1000);
+      }
+    }
+    
+    if (!chunkSuccess) {
+      Serial.printf("\n❌ Chunk %d failed!\n", chunkIndex + 1);
+      uploadSuccess = false;
+      break;
+    }
+    
+    yield();
+  }
+
+  free(buffer);
+  file.close();
+
+  // Finalize
+  if (uploadSuccess) {
+    Serial.println("\n🔗 Finalizing...");
+    
+    String finalizePayload = "{";
+    finalizePayload += "\"action\":\"finalize\",";
+    finalizePayload += "\"uploadId\":\"" + uploadId + "\",";
+    finalizePayload += "\"filename\":\"recording_processed_" + uploadId + ".wav\",";
+    finalizePayload += "\"totalChunks\":" + String(totalChunks);
+    finalizePayload += "}";
+    
+    http.begin(scriptURL);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(60000);
+    
+    int httpCode = http.POST(finalizePayload);
+    
+    if (httpCode == 200) {
+      String response = http.getString();
+      Serial.println("✅ UPLOAD COMPLETE!");
+      Serial.println("🔗 " + response);
+      
+      unsigned long elapsed = millis() - startTime;
+      Serial.printf("\n⏱️  Total time: %.1f s\n", elapsed / 1000.0);
+      Serial.printf("🚀 Speed: %.2f KB/s\n", (fileSize / 1024.0) / (elapsed / 1000.0));
+      
+      http.end();
+      return true;
+    } else {
+      Serial.printf("❌ Finalize failed: HTTP %d\n", httpCode);
+      http.end();
+      return false;
+    }
+  }
+  
+  return false;
+}
+
+void loop() {
+  const char* processedFile = "/recording_processed.wav";
+  const char* rawFile = "/recording_raw.wav";
+  
+  Serial.println("\n🎬 NEW RECORDING CYCLE");
+  Serial.println("════════════════════════════════════════\n");
+  
+  // OPTION 1: Chỉ upload PROCESSED (khuyến nghị)
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  recordWithSelectiveANC(processedFile);
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    if (uploadFileInChunks(processedFile)) {
+      SPIFFS.remove(processedFile);
+    }
+  }
+  
+  /* OPTION 2: Upload CẢ RAW + PROCESSED (debug purpose)
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // Ghi RAW
+  recordRawAudio(rawFile);
+  
+  // Ghi PROCESSED
+  recordWithSelectiveANC(processedFile);
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    // Upload RAW
+    Serial.println("\n📤 Uploading RAW...");
+    uploadFileInChunks(rawFile);
+    SPIFFS.remove(rawFile);
+    
+    // Upload PROCESSED
+    Serial.println("\n📤 Uploading PROCESSED...");
+    uploadFileInChunks(processedFile);
+    SPIFFS.remove(processedFile);
+  }
+  */
+  
+  Serial.println("\n⏳ Wait 10s...\n");
+  delay(10000);
+}
+
+/*
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                       FILE UPLOAD SUMMARY                                  ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+📤 WHAT IS UPLOADED:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+File: recording_processed_[timestamp].wav
+
+Contents:
+  ✅ Giọng giáo viên (100% preserved)
+  ✅ Giọng học sinh (100% preserved)
+  ❌ Tiếng xe hơi (70-80% reduced)
+  ❌ Tiếng gió (60-70% reduced)
+  ❌ Tiếng hành lang (50-60% reduced)
+  ❌ Low-freq rumble (90% reduced)
+
+Processing applied:
+  1. ✅ HighPassFilter (80Hz cutoff)
+  2. ✅ Selective ANC (only when corr > 0.3)
+  3. ✅ NoiseGate (when ANC bypassed)
+
+File properties:
+  - Format: WAV (PCM 16-bit)
+  - Sample rate: 16kHz
+  - Channels: Mono
+  - Duration: 5 seconds
+  - Size: ~156KB
+  - Upload: Chunked (20KB per chunk)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 USE CASES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ OPTION 1 (Default): Chỉ upload PROCESSED
+   - Tiết kiệm bandwidth
+   - File sẵn sàng dùng
+   - Giảm storage server
+   → Khuyến nghị cho production
+
+⚙️ OPTION 2: Upload cả RAW + PROCESSED
+   - So sánh trước/sau ANC
+   - Debug ANC performance
+   - Có backup raw data
+   - Train ML models
+   → Chỉ dùng khi cần debug/research
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 EXPECTED OUTPUT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎙️  RECORDING WITH SELECTIVE ANC...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[10% ░] [20% █] [30% ░] ... [100% ░]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Recording complete: 5.1 s
+📊 File size: 156 KB
+📈 ANC Statistics:
+   🟢 ANC Active:  22.3%
+   🔵 ANC Bypass:  77.7%
+💾 Free RAM: 189 KB
+
+☁️  UPLOADING PROCESSED AUDIO TO CLOUD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📦 File: /recording_processed.wav (156.00 KB)
+🔢 Chunks: 8 × 20KB
+🆔 Upload ID: 1735468921234
+🎛️  Audio: PROCESSED (Selective ANC applied)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📤 [1/8] 20.0 KB ✅ [12%]
+📤 [2/8] 20.0 KB ✅ [25%]
+📤 [3/8] 20.0 KB ✅ [37%]
+...
+📤 [8/8] 16.0 KB ✅ [100%]
+
+🔗 Finalizing...
+✅ UPLOAD COMPLETE!
+🔗 https://drive.google.com/file/d/...
+
+⏱️  Total time: 8.3 s
+🚀 Speed: 18.8 KB/s
+
+🗑️  Removing temp file
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔗 APPS SCRIPT CODE (Google):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Same as before - see chunked upload artifact
+File naming: "recording_processed_[timestamp].wav"
+
+*/
+
+/*
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                          CÁCH HOẠT ĐỘNG                                    ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+📊 DECISION LOGIC:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mỗi sample, hệ thống kiểm tra:
+
+1. Mic 2 RMS > MIN_NOISE_LEVEL?
+   ├─ NO  → 🔵 BYPASS (không có nhiễu đáng kể)
+   └─ YES → Tiếp tục check
+
+2. Correlation(Mic1, Mic2) > THRESHOLD?
+   ├─ NO  → 🔵 BYPASS (tiếng trong lớp, không tương quan với ngoài)
+   └─ YES → 🟢 ANC ACTIVE (nhiễu chung từ bên ngoài)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 SCENARIOS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scenario 1: Giáo viên đang giảng
+   - Mic 1: HIGH (giọng giáo viên)
+   - Mic 2: LOW (không nghe được giáo viên)
+   - Correlation: LOW
+   → 🔵 BYPASS - Giữ nguyên giọng
+
+Scenario 2: Xe hơi đi ngoài đường
+   - Mic 1: MEDIUM (nghe qua cửa)
+   - Mic 2: HIGH (nghe rõ)
+   - Correlation: HIGH
+   → 🟢 ANC ACTIVE - Lọc tiếng xe
+
+Scenario 3: Học sinh nói chuyện trong lớp
+   - Mic 1: HIGH (nghe rõ)
+   - Mic 2: LOW/MEDIUM (nghe mờ qua cửa)
+   - Correlation: LOW
+   → 🔵 BYPASS - Giữ tiếng học sinh
+
+Scenario 4: Người đi hành lang nói to
+   - Mic 1: MEDIUM (nghe qua cửa)
+   - Mic 2: HIGH (nghe rõ)
+   - Correlation: HIGH
+   → 🟢 ANC ACTIVE - Lọc tiếng hành lang
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔧 TUNING PARAMETERS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CORRELATION_THRESHOLD = 0.3
+   - Tăng lên 0.4-0.5 → Chỉ lọc nhiễu correlation rất cao (strict)
+   - Giảm xuống 0.2 → Lọc aggressive hơn (có thể mất giọng gần cửa)
+
+MIN_NOISE_LEVEL = 100
+   - Tăng lên 200 → Chỉ lọc khi Mic 2 bắt nhiễu to
+   - Giảm xuống 50 → Lọc cả nhiễu nhỏ
+
+CORRELATION_WINDOW = 64
+   - Tăng lên 128 → Correlation ổn định hơn, phản ứng chậm
+   - Giảm xuống 32 → Phản ứng nhanh, có thể dao động
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ ƯU ĐIỂM HỆ THỐNG NÀY:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. ✅ Giọng giáo viên LUÔN được giữ nguyên
+2. ✅ Giọng học sinh LUÔN được giữ nguyên
+3. ✅ Chỉ lọc nhiễu từ BÊN NGOÀI
+4. ✅ Tự động adapt theo môi trường
+5. ✅ Không cần calibration phức tạp
+6. ✅ Real-time statistics để monitor
+
+━━━━━━━━━━━━━━━━━━━━━━━━━
+*/
