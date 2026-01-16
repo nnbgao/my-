@@ -1,0 +1,241 @@
+Má cay quá
+import machine
+import network
+import time
+import struct
+import usocket
+import ssl
+import os
+import gc
+
+# ================= 1. CẤU HÌNH NGƯỜI DÙNG =================
+# (Đã điền sẵn thông tin bạn cung cấp)
+WIFI_SSID = "Bảo's Galaxy A32"
+WIFI_PASS = "dsup4046"
+
+BOT_TOKEN = "8521958601:AAF3a6g7xJNuRWq3ymr6CcaDS5X2sU2-aFM"
+CHAT_ID = "8519338843"
+
+# ================= 2. CẤU HÌNH HỆ THỐNG =================
+RECORD_TIME = 5       # Thời gian thu âm: 5 giây
+SAMPLE_RATE = 16000   # Tần số: 16kHz
+GAIN_FACTOR = 8       # Nhân âm lượng lên 8 lần
+FILENAME = "rec.wav"
+
+# Chân kết nối INMP441
+I2S_SCK = 4
+I2S_WS = 5
+I2S_SD = 6
+
+# ================= 3. HÀM KẾT NỐI WIFI (CÓ FIX DNS) =================
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    
+    if not wlan.isconnected():
+        print('>>> Đang kết nối WiFi...', end='')
+        wlan.connect(WIFI_SSID, WIFI_PASS)
+        
+        # Đợi kết nối (Timeout 15s)
+        attempt = 0
+        while not wlan.isconnected() and attempt < 15:
+            print('.', end='')
+            time.sleep(1)
+            attempt += 1
+            
+    if wlan.isconnected():
+        # --- QUAN TRỌNG: FIX DNS CHO GALAXY A32 ---
+        # Lấy IP hiện tại và ép DNS về Google (8.8.8.8)
+        
+        print('\n>>> WiFi OK! IP:', wlan.ifconfig()[0])
+        print('>>> DNS set to:', wlan.ifconfig()[3])
+        return True
+    else:
+        print('\n>>> LỖI: Kết nối WiFi thất bại!')
+        return False
+
+# ================= 4. HÀM TẠO HEADER WAV CHUẨN =================
+def create_wav_header(sampleRate, bitsPerSample, num_channels, num_samples):
+    datasize = num_samples * num_channels * (bitsPerSample // 8)
+    o = bytes("RIFF", 'ascii')                                  
+    o += struct.pack('<I', datasize + 36)                       
+    o += bytes("WAVE", 'ascii')                                 
+    o += bytes("fmt ", 'ascii')                                 
+    o += struct.pack('<I', 16)                                  
+    o += struct.pack('<H', 1)                                   
+    o += struct.pack('<H', num_channels)                        
+    o += struct.pack('<I', sampleRate)                          
+    o += struct.pack('<I', sampleRate * num_channels * (bitsPerSample // 8)) 
+    o += struct.pack('<H', num_channels * (bitsPerSample // 8)) 
+    o += struct.pack('<H', bitsPerSample)                       
+    o += bytes("data", 'ascii')                                 
+    o += struct.pack('<I', datasize)                            
+    return o
+
+# ================= 5. HÀM THU ÂM (CÓ WARM-UP & GAIN) =================
+def record_audio(filename):
+    print("\n--------------------------------")
+    print(">>> Khởi động Mic & Cấp xung clock...")
+    
+    # 1. Khởi tạo I2S
+    audio_in = machine.I2S(
+        0,
+        sck=machine.Pin(I2S_SCK),
+ws=machine.Pin(I2S_WS),
+        sd=machine.Pin(I2S_SD),
+        mode=machine.I2S.RX,
+        bits=16,
+        format=machine.I2S.MONO,
+        rate=SAMPLE_RATE,
+        ibuf=20000 
+    )
+
+    # 2. --- GIAI ĐOẠN ỔN ĐỊNH (WARM-UP) ---
+    # Đọc và vứt bỏ dữ liệu trong 100ms để mic ổn định, tránh tiếng bụp
+    print(">>> Đang làm nóng Mic (bỏ 100ms đầu)...")
+    trash_buffer = bytearray(1024)
+    trash_mv = memoryview(trash_buffer)
+    
+    start_warmup = time.ticks_ms()
+    # Chạy vòng lặp rỗng trong 100ms (0.1s)
+    while time.ticks_diff(time.ticks_ms(), start_warmup) < 100:
+        audio_in.readinto(trash_mv)
+    # --------------------------------------
+
+    print(f">>> BẮT ĐẦU THU ÂM ({RECORD_TIME}s)...")
+
+    # 3. Mở file và ghi dữ liệu thật
+    f = open(filename, 'wb')
+    
+    # Tạo Header tạm
+    num_samples_est = RECORD_TIME * SAMPLE_RATE
+    header = create_wav_header(SAMPLE_RATE, 16, 1, num_samples_est)
+    f.write(header)
+
+    mic_samples = bytearray(2048)
+    mic_samples_mv = memoryview(mic_samples)
+    
+    num_bytes_written = 0
+    start_time = time.time()
+    
+    while time.time() - start_time < RECORD_TIME:
+        num_read = audio_in.readinto(mic_samples_mv)
+        
+        if num_read > 0:
+            # --- XỬ LÝ GAIN (TĂNG ÂM LƯỢNG) ---
+            count = num_read // 2
+            format_str = f"<{count}h" 
+            # Giải nén byte thành số nguyên
+            samples = list(struct.unpack(format_str, mic_samples[:num_read]))
+            
+            # Nhân Gain và cắt ngọn (Clipping)
+            for i in range(len(samples)):
+                val = samples[i] * GAIN_FACTOR
+                if val > 32767: val = 32767
+                elif val < -32768: val = -32768
+                samples[i] = val
+            
+            # Đóng gói lại và ghi vào file
+            f.write(struct.pack(format_str, *samples))
+            num_bytes_written += num_read
+            # ----------------------------------
+            
+    audio_in.deinit() # Tắt Mic
+    
+    # Cập nhật Header với kích thước thật
+    f.seek(0)
+    f.write(create_wav_header(SAMPLE_RATE, 16, 1, num_bytes_written // 2))
+    f.close()
+    print(f">>> Thu xong. Đã lưu: {num_bytes_written} bytes.")
+    return num_bytes_written
+
+# ================= 6. HÀM GỬI TELEGRAM (SOCKET MẠNH MẼ) =================
+def send_telegram(filename):
+    print("\n>>> Chuẩn bị gửi Telegram...")
+    
+    # Kiểm tra file có tồn tại không
+    try:
+        f_size = os.stat(filename)[6]
+    except OSError:
+        print("Lỗi: Không tìm thấy file ghi âm!")
+        return
+
+    # Tạo Multipart Body thủ công
+    boundary = "---Esp32Boundary123"
+    
+    part1 = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{CHAT_ID}\r\n'
+        f"--{boundary}\r\n"
+f'Content-Disposition: form-data; name="document"; filename="voice_msg.wav"\r\n'
+        f"Content-Type: audio/x-wav\r\n\r\n"
+    )
+    
+    part2 = f"\r\n--{boundary}--\r\n"
+    
+    total_len = len(part1) + f_size + len(part2)
+
+    # Kết nối Socket bảo mật (SSL)
+    try:
+        print("Đang kết nối Server Telegram...")
+        sock = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
+        addr = usocket.getaddrinfo("api.telegram.org", 443)[0][-1]
+        
+        sock.connect(addr)
+        sock = ssl.wrap_socket(sock) # Mã hóa SSL
+        
+        print("Đang gửi dữ liệu...")
+        # Gửi HTTP Header
+        sock.write(f"POST /bot{BOT_TOKEN}/sendDocument HTTP/1.1\r\n".encode())
+        sock.write(b"Host: api.telegram.org\r\n")
+        sock.write(f"Content-Length: {total_len}\r\n".encode())
+        sock.write(f"Content-Type: multipart/form-data; boundary={boundary}\r\n".encode())
+        sock.write(b"\r\n")
+        
+        # Gửi Body Phần 1
+        sock.write(part1.encode())
+        
+        # Gửi nội dung file (Chia nhỏ để gửi)
+        with open(filename, "rb") as f:
+            while True:
+                chunk = f.read(1024)
+                if not chunk: break
+                sock.write(chunk)
+                
+        # Gửi Body Phần 2 (Kết thúc)
+        sock.write(part2.encode())
+        
+        print("Đã gửi xong. Đang đợi phản hồi...")
+        
+        # Đọc phản hồi
+        response = sock.read(512)
+        if response:
+            print("Server phản hồi:", response.decode()[:100])
+        else:
+            print("Không có phản hồi (nhưng có thể đã gửi thành công)")
+            
+        sock.close()
+        
+    except Exception as e:
+        print("!!! LỖI GỬI TELEGRAM:", e)
+
+# ================= 7. CHƯƠNG TRÌNH CHÍNH =================
+try:
+    gc.collect() # Dọn dẹp RAM trước khi chạy
+    
+    if connect_wifi():
+        # Bước 1: Thu âm (Có warm-up)
+        record_audio(FILENAME)
+        
+        # Dọn RAM lần nữa cho chắc
+        gc.collect()
+        
+        # Bước 2: Gửi đi
+        send_telegram(FILENAME)
+        
+    print("\n>>> HOÀN TẤT CHƯƠNG TRÌNH.")
+        
+except KeyboardInterrupt:
+    print("\nĐã dừng chương trình.")
+except Exception as e:
+    print("\nLỗi hệ thống:", e)
