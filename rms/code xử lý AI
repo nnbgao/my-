@@ -1,0 +1,261 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <driver/i2s.h>
+
+// >>> IMPORT THƯ VIỆN EDGE IMPULSE CỦA BẠN <<<
+#include <Ph_n_lo_i_ti_ng_n_trong_l_p_h_c_inferencing.h>
+
+// --- CẤU HÌNH WIFI & TELEGRAM ---
+const char* ssid = "TEN_WIFI_NHA_BAN";
+const char* password = "MAT_KHAU_WIFI";
+const char* botToken = "8521958601:AAF3a6g7xJNuRWq3ymr6CcaDS5X2sU2-aFM"; // Token của bạn
+const char* chatID = "8519338843"; // Chat ID của bạn
+
+// --- CẤU HÌNH PIN CHO ESP32-S3 (Sửa lại theo mạch thực tế) ---
+#define I2S_SD      10  // Chân Data chung
+#define I2S_WS      11  // Chân Word Select (LRCK) chung
+#define I2S_SCK     12  // Chân Clock (BCLK) chung
+
+// Chân cấp nguồn (VCC) cho 2 Mic để bật/tắt
+#define PIN_MIC_L_POWER  4  // Chân Digital cấp nguồn cho Mic Trái
+#define PIN_MIC_R_POWER  5  // Chân Digital cấp nguồn cho Mic Phải
+
+// --- CẤU HÌNH ÂM THANH ---
+#define SAMPLE_RATE     16000
+#define RECORD_TIME_SEC 2
+// Số lượng mẫu cần cho AI (16000 mẫu/s * 2s = 32000 mẫu)
+#define EI_SAMPLE_COUNT (SAMPLE_RATE * RECORD_TIME_SEC)
+
+// Buffer lưu âm thanh (float) để đưa vào AI
+float features[EI_SAMPLE_COUNT];
+
+// Cấu hình I2S
+i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // Đọc cả 2 kênh stereo để so sánh
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false
+};
+
+i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+};
+
+// --- HÀM ĐIỀU KHIỂN NGUỒN MIC ---
+void powerMics(bool leftOn, bool rightOn) {
+    digitalWrite(PIN_MIC_L_POWER, leftOn ? HIGH : LOW);
+    digitalWrite(PIN_MIC_R_POWER, rightOn ? HIGH : LOW);
+}
+
+// --- HÀM KHỞI TẠO I2S ---
+void setupI2S() {
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+// --- HÀM XÁC ĐỊNH HƯỚNG ÂM THANH (GIẢ LẬP TDOA/AMPLITUDE) ---
+// Trả về: 0 = Trái, 1 = Phải
+int detectDirection() {
+    Serial.println("--- Đang xác định hướng âm thanh ---");
+    
+    // 1. Bật cả 2 Mic
+    powerMics(true, true);
+    delay(50); // Chờ mic ổn định điện áp
+    
+    // 2. Đọc mẫu ngắn (ví dụ 200ms)
+    int samplesToCheck = 3200; // 0.2s * 16000
+    int32_t sumL = 0;
+    int32_t sumR = 0;
+    
+    int16_t buffer32[2]; // Buffer tạm chứa L và R
+    size_t bytesRead;
+
+    // Xả buffer cũ
+    i2s_zero_dma_buffer(I2S_NUM_0);
+    
+    for (int i = 0; i < samplesToCheck; i++) {
+        // Đọc 4 byte (2 byte trái + 2 byte phải)
+        i2s_read(I2S_NUM_0, &buffer32, sizeof(buffer32), &bytesRead, portMAX_DELAY);
+        if (bytesRead == 4) {
+            sumL += abs(buffer32[0]); // Kênh trái (Giả sử Mic L set L/R=GND)
+            sumR += abs(buffer32[1]); // Kênh phải (Giả sử Mic R set L/R=VCC)
+        }
+    }
+
+    Serial.printf("Năng lượng Trái: %d | Phải: %d\n", sumL, sumR);
+
+    // 3. So sánh
+    if (sumL > sumR) {
+        Serial.println("=> Hướng: TRÁI");
+        return 0; 
+    } else {
+        Serial.println("=> Hướng: PHẢI");
+        return 1;
+    }
+}
+
+// --- HÀM THU ÂM CHÍNH ---
+bool recordAudio(int selectedMic) {
+    Serial.println("--- Bắt đầu quy trình thu âm ---");
+
+    // 1. Cấu hình nguồn theo hướng đã chọn
+    if (selectedMic == 0) {
+        powerMics(true, false); // Bật Trái, Tắt Phải
+        Serial.println("Mic đang dùng: TRÁI");
+    } else {
+        powerMics(false, true); // Tắt Trái, Bật Phải
+        Serial.println("Mic đang dùng: PHẢI");
+    }
+
+    // 2. Delay 10ms tránh nhiễu (theo yêu cầu)
+    delay(10); 
+
+    // 3. Xả buffer I2S để tránh dữ liệu cũ lúc chuyển nguồn
+    i2s_zero_dma_buffer(I2S_NUM_0);
+
+    // 4. Thu âm 2s
+    size_t bytesRead;
+    int16_t sampleBuffer[1]; // Đọc từng mẫu mono (vì 1 mic tắt rồi)
+    
+    // Lưu ý: Khi tắt 1 mic, I2S vẫn có thể đọc stereo nhưng 1 kênh sẽ là rác hoặc 0.
+    // Ta cần đọc cẩn thận. Để đơn giản, ta đọc 1 cặp stereo rồi lấy kênh active.
+    int16_t stereoBuffer[2]; 
+
+    for (int i = 0; i < EI_SAMPLE_COUNT; i++) {
+        i2s_read(I2S_NUM_0, &stereoBuffer, sizeof(stereoBuffer), &bytesRead, portMAX_DELAY);
+        
+        if (bytesRead == 4) {
+            // Nếu chọn Mic Trái (index 0), lấy buffer[0]. Mic Phải (index 1), lấy buffer[1]
+            // Chuyển sang float cho AI
+            if (selectedMic == 0) {
+                 features[i] = (float)stereoBuffer[0];
+            } else {
+                 features[i] = (float)stereoBuffer[1];
+            }
+        } else {
+            features[i] = 0;
+        }
+    }
+    
+    Serial.println("Đã thu xong 2 giây âm thanh.");
+    // Tắt hết mic để tiết kiệm điện sau khi thu
+    powerMics(false, false); 
+    return true;
+}
+
+// --- GỬI TELEGRAM ---
+void sendTelegram(String message) {
+    Serial.println("Đang kết nối WiFi để gửi Telegram...");
+    
+    // Chỉ bật WiFi khi cần gửi để tránh nhiễu lúc thu âm
+    WiFi.begin(ssid, password);
+    int retry = 0;
+    while (WiFi.status() != WL_CONNECTED && retry < 20) {
+        delay(500); Serial.print(".");
+        retry++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFiClientSecure client;
+        client.setInsecure(); // Bỏ qua check SSL
+        if (client.connect("api.telegram.org", 443)) {
+            String url = "/bot" + String(botToken) + "/sendMessage?chat_id=" + String(chatID) + "&text=" + message;
+            
+            // Gửi request
+            client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+                         "Host: api.telegram.org\r\n" + 
+                         "Connection: close\r\n\r\n");
+            Serial.println("\nĐã gửi tin nhắn: " + message);
+        } else {
+            Serial.println("\nLỗi kết nối Telegram server");
+        }
+        // Ngắt WiFi sau khi gửi xong
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+    } else {
+        Serial.println("\nKhông kết nối được WiFi.");
+    }
+}
+
+// --- CALLBACK CỦA EDGE IMPULSE ---
+int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
+    memcpy(out_ptr, features + offset, length * sizeof(float));
+    return 0;
+}
+
+void setup() {
+    Serial.begin(115200);
+    
+    // Cấu hình chân nguồn Mic
+    pinMode(PIN_MIC_L_POWER, OUTPUT);
+    pinMode(PIN_MIC_R_POWER, OUTPUT);
+    
+    // Đảm bảo tắt WiFi ban đầu để tránh nhiễu RF vào Mic
+    WiFi.mode(WIFI_OFF);
+
+    // Khởi động I2S
+    setupI2S();
+    
+    Serial.println("Hệ thống sẵn sàng. Bắt đầu chu trình...");
+}
+
+void loop() {
+    // === BƯỚC 1: XÁC ĐỊNH VỊ TRÍ (TDOA/Energy) ===
+    int direction = detectDirection(); // 0 = Trái, 1 = Phải
+    
+    // === BƯỚC 2: THU ÂM TỪ MIC ĐƯỢC CHỌN ===
+    // (Bao gồm delay 10ms bên trong hàm)
+    recordAudio(direction);
+
+    // === BƯỚC 3: PHÂN TÍCH AI ===
+    Serial.println("Đang chạy phân tích AI...");
+    signal_t signal;
+    signal.total_length = EI_SAMPLE_COUNT;
+    signal.get_data = &raw_feature_get_data;
+
+    ei_impulse_result_t result = { 0 };
+    EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
+
+    if (res != EI_IMPULSE_OK) {
+        Serial.println("Lỗi chạy Classifier");
+        delay(1000);
+        return;
+    }
+
+    // === BƯỚC 4: XỬ LÝ KẾT QUẢ & GỬI TELEGRAM ===
+    String bestLabel = "";
+    float bestScore = 0.0;
+
+    Serial.println("Kết quả chi tiết:");
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        Serial.printf("    %s: %.5f\n", result.classification[ix].label, result.classification[ix].value);
+        if (result.classification[ix].value > bestScore) {
+            bestScore = result.classification[ix].value;
+            bestLabel = String(result.classification[ix].label);
+        }
+    }
+
+    String dirStr = (direction == 0) ? " (Nguồn: Trái)" : " (Nguồn: Phải)";
+    
+    // Chỉ gửi nếu độ tin cậy > 60%
+    if (bestScore > 0.6) {
+        String msg = "Phát hiện: " + bestLabel + dirStr + " - Độ tin cậy: " + String(bestScore * 100, 1) + "%";
+        sendTelegram(msg);
+    } else {
+        Serial.println("Âm thanh không rõ ràng, không gửi tin nhắn.");
+    }
+
+    // Nghỉ 10 giây trước khi lặp lại quy trình
+    Serial.println("Nghỉ 10s...");
+    delay(10000);
+}
