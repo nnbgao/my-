@@ -1,0 +1,67 @@
+#include <Arduino.h>
+#include <driver/i2s.h>
+
+// --- CẤU HÌNH PIN (GIỐNG CODE CŨ) ---
+#define I2S_SD      10
+#define I2S_WS      11
+#define I2S_SCK     12
+#define PIN_MIC_L_POWER  4
+#define PIN_MIC_R_POWER  5
+
+// --- CẤU HÌNH ÂM THANH ---
+#define SAMPLE_RATE     16000
+
+// Cấu hình I2S
+i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // Chỉ cần thu 1 kênh để train
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false
+};
+
+i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+};
+
+void setup() {
+    // Tốc độ Serial phải cực cao để kịp đẩy âm thanh 16kHz
+    Serial.begin(460800); 
+
+    // Cấp nguồn cho Mic
+    pinMode(PIN_MIC_L_POWER, OUTPUT);
+    pinMode(PIN_MIC_R_POWER, OUTPUT);
+    
+    // CHÚ Ý: Ở đây mình bật Mic TRÁI để thu mẫu training.
+    // Nếu muốn train cho Mic Phải, đổi thành LOW, HIGH.
+    // Nhưng vì 2 mic giống nhau, train 1 mic là đủ.
+    digitalWrite(PIN_MIC_L_POWER, HIGH); 
+    digitalWrite(PIN_MIC_R_POWER, LOW);
+    
+    delay(100); // Chờ mic ổn định
+
+    // Khởi động I2S
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+}
+
+void loop() {
+    int16_t sampleBuffer[64]; // Đọc từng gói nhỏ
+    size_t bytesRead;
+
+    i2s_read(I2S_NUM_0, &sampleBuffer, sizeof(sampleBuffer), &bytesRead, portMAX_DELAY);
+
+    // Gửi dữ liệu ra Serial để máy tính nhận
+    // Chúng ta gửi từng mẫu một, cách nhau bởi dấu xuống dòng
+    int samples = bytesRead / 2;
+    for (int i = 0; i < samples; i++) {
+        Serial.println(sampleBuffer[i]);
+    }
+}
