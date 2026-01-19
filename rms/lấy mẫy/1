@@ -1,0 +1,142 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <driver/i2s.h>
+
+/* ========= WIFI + TELEGRAM ========= */
+const char* ssid = "TEN_WIFI";
+const char* password = "MAT_KHAU";
+const char* botToken = "BOT_TOKEN_MOI";   // ⚠️ ĐỔI TOKEN
+const char* chatID   = "CHAT_ID";
+
+/* ========= I2S PIN ========= */
+#define I2S_SCK  14
+#define I2S_WS   15
+#define I2S_SD   16
+
+/* ========= AUDIO ========= */
+#define SAMPLE_RATE     16000
+#define RECORD_TIME_SEC 2
+#define TOTAL_SAMPLES   (SAMPLE_RATE * RECORD_TIME_SEC)
+#define GAIN            8
+
+int32_t i2sBuffer[TOTAL_SAMPLES];
+int16_t audio[TOTAL_SAMPLES];
+
+/* ========= I2S CONFIG ========= */
+i2s_config_t i2s_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+  .sample_rate = SAMPLE_RATE,
+  .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+  .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+  .dma_buf_count = 8,
+  .dma_buf_len = 64,
+  .use_apll = false
+};
+
+i2s_pin_config_t pin_config = {
+  .bck_io_num = I2S_SCK,
+  .ws_io_num = I2S_WS,
+  .data_out_num = I2S_PIN_NO_CHANGE,
+  .data_in_num = I2S_SD
+};
+
+/* ========= I2S ========= */
+void setupI2S() {
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+/* ========= RECORD + FILTER ========= */
+void recordAudio() {
+  size_t totalRead = 0;
+  while (totalRead < TOTAL_SAMPLES * 4) {
+    size_t br;
+    i2s_read(I2S_NUM_0,
+             (char*)i2sBuffer + totalRead,
+             TOTAL_SAMPLES * 4 - totalRead,
+             &br,
+             portMAX_DELAY);
+    totalRead += br;
+  }
+
+  // DC removal
+  int32_t mean = 0;
+  for (int i = 0; i < TOTAL_SAMPLES; i++)
+    mean += (i2sBuffer[i] >> 14);
+  mean /= TOTAL_SAMPLES;
+
+  // Convert + gain + clip
+  for (int i = 0; i < TOTAL_SAMPLES; i++) {
+    int32_t v = (i2sBuffer[i] >> 14) - mean;
+    v *= GAIN;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    audio[i] = v;
+  }
+}
+
+/* ========= SEND VOICE ========= */
+void sendVoiceTelegram() {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  if (!client.connect("api.telegram.org", 443)) return;
+
+  String boundary = "ESP32VOICE";
+  String head =
+    "--" + boundary + "\r\n"
+    "Content-Disposition: form-data; name=\"voice\"; filename=\"voice.pcm\"\r\n"
+    "Content-Type: audio/pcm\r\n\r\n";
+
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  size_t contentLength =
+    head.length() + TOTAL_SAMPLES * 2 + tail.length();
+
+  client.println("POST /bot" + String(botToken) +
+                 "/sendVoice?chat_id=" + String(chatID) +
+                 "&duration=2 HTTP/1.1");
+  client.println("Host: api.telegram.org");
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.println("Content-Length: " + String(contentLength));
+  client.println();
+  client.print(head);
+
+  client.write((uint8_t*)audio, TOTAL_SAMPLES * 2);
+  client.print(tail);
+
+  while (client.connected()) client.read();
+  client.stop();
+}
+
+/* ========= SETUP ========= */
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(300);
+
+  setupI2S();
+  Serial.println("READY");
+}
+
+/* ========= LOOP ========= */
+void loop() {
+  Serial.println("Recording...");
+  recordAudio();
+
+  // Debug mức âm
+  int16_t maxv = 0;
+  for (int i = 0; i < TOTAL_SAMPLES; i++)
+    if (abs(audio[i]) > maxv) maxv = abs(audio[i]);
+  Serial.print("MAX = ");
+  Serial.println(maxv);
+
+  Serial.println("Sending voice...");
+  sendVoiceTelegram();
+
+  delay(5000);
+}
