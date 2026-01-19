@@ -4,8 +4,8 @@
 #include <driver/i2s.h>
 
 // ================= 1. CẤU HÌNH WIFI & TELEGRAM =================
-const char* ssid = "TEN_WIFI_NHA_BAN";
-const char* password = "MAT_KHAU_WIFI";
+const char* ssid = "I002";
+const char* password = "THTH2024";
 const char* botToken = "8521958601:AAF3a6g7xJNuRWq3ymr6CcaDS5X2sU2-aFM"; 
 const char* chatID = "8519338843"; 
 
@@ -27,7 +27,7 @@ const char* chatID = "8519338843";
 
 // ================= 3. CẤU HÌNH ÂM THANH (ĐÃ FIX LỖI MẤT TIẾNG) =================
 #define SAMPLE_RATE     16000
-#define RECORD_TIME_SEC 5      // Thu 5 giây
+#define RECORD_TIME_SEC 2      // Thu 2 giây
 #define GAIN_FACTOR     10     // [FIX 1] Nhân to gấp 10 lần để nghe rõ
 
 #define TOTAL_SAMPLES   (SAMPLE_RATE * RECORD_TIME_SEC)
