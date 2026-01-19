@@ -1,1 +1,210 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <driver/i2s.h>
+
+// >>> QUAN TRỌNG: ĐỔI TÊN THƯ VIỆN NÀY THEO THƯ VIỆN CỦA BẠN <<<
+#include <Ph_n_lo_i_ti_ng_n_trong_l_p_h_c_inferencing.h>
+
+// --- 1. CẤU HÌNH WIFI & TELEGRAM ---
+const char* ssid = "TEN_WIFI_NHA_BAN";
+const char* password = "MAT_KHAU_WIFI";
+const char* botToken = "8521958601:AAF3a6g7xJNuRWq3ymr6CcaDS5X2sU2-aFM"; 
+const char* chatID = "8519338843"; 
+
+// --- 2. CẤU HÌNH PIN ---
+#define I2S_SD      10
+#define I2S_WS      11
+#define I2S_SCK     12
+#define PIN_MIC_L_POWER  4  // Chân nguồn Mic Trái
+
+// --- 3. CẤU HÌNH ÂM THANH ---
+#define SAMPLE_RATE     16000
+#define RECORD_TIME_SEC 2
+#define EI_SAMPLE_COUNT (SAMPLE_RATE * RECORD_TIME_SEC)
+
+float features[EI_SAMPLE_COUNT];
+
+// Cấu hình I2S (Chỉ đọc kênh Trái - Mono)
+i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, 
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false
+};
+
+i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+};
+
+// --- HÀM KHỞI TẠO I2S ---
+void setupI2S() {
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+// --- HÀM THU ÂM ---
+bool recordAudio() {
+    Serial.println("--- Đang thu âm... ---");
+    // Bật Mic
+    digitalWrite(PIN_MIC_L_POWER, HIGH);
+    delay(50); // Chờ mic ổn định
+    
+    // Xóa buffer cũ
+    i2s_zero_dma_buffer(I2S_NUM_0);
+
+    size_t bytesRead;
+    int16_t sampleBuffer[1]; // Buffer 1 mẫu (vì là Mono)
+    
+    for (int i = 0; i < EI_SAMPLE_COUNT; i++) {
+        // Đọc 2 byte
+        i2s_read(I2S_NUM_0, &sampleBuffer, sizeof(sampleBuffer), &bytesRead, portMAX_DELAY);
+        if (bytesRead == 2) {
+            features[i] = (float)sampleBuffer[0];
+        } else {
+            features[i] = 0;
+        }
+    }
+    
+    // Tắt Mic sau khi thu xong
+    digitalWrite(PIN_MIC_L_POWER, LOW); 
+    return true;
+}
+
+// --- HÀM GỬI TELEGRAM (CÓ THỬ LẠI KHI LỖI) ---
+void sendTelegram(String message) {
+    int maxRetries = 3; // Thử tối đa 3 lần
+    int attempt = 0;
+    bool sentSuccess = false;
+
+    Serial.println("Chuẩn bị gửi Telegram...");
+
+    while (attempt < maxRetries && !sentSuccess) {
+        attempt++;
+        
+        // 1. Kiểm tra kết nối mạng
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.printf("Mất WiFi. Đang nối lại (Lần %d)...\n", attempt);
+            WiFi.reconnect();
+            // Chờ tối đa 3s để nối lại WiFi
+            long startWait = millis();
+            while (WiFi.status() != WL_CONNECTED && (millis() - startWait < 3000)) {
+                delay(100);
+            }
+        }
+
+        // 2. Thực hiện gửi nếu có mạng
+        if (WiFi.status() == WL_CONNECTED) {
+            WiFiClientSecure client;
+            client.setInsecure(); // Bỏ qua SSL check
+            client.setTimeout(5000); // Timeout 5s
+
+            if (client.connect("api.telegram.org", 443)) {
+                String url = "/bot" + String(botToken) + "/sendMessage?chat_id=" + String(chatID) + "&text=" + message;
+                
+                client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+                             "Host: api.telegram.org\r\n" + 
+                             "Connection: close\r\n\r\n");
+                
+                // Đọc phản hồi để xác nhận server đã nhận
+                while (client.connected()) {
+                    String line = client.readStringUntil('\n');
+                    if (line == "\r") break;
+                }
+                
+                Serial.println("-> Đã gửi thành công!");
+                sentSuccess = true; 
+            } else {
+                Serial.println("-> Lỗi kết nối Telegram Server. Đang thử lại...");
+                delay(1000);
+            }
+        } else {
+            Serial.println("-> Không thể kết nối WiFi.");
+        }
+    }
+
+    if (!sentSuccess) {
+        Serial.println("!!! GỬI THẤT BẠI SAU 3 LẦN THỬ -> BỎ QUA !!!");
+    }
+}
+
+// --- CALLBACK CHO EDGE IMPULSE ---
+int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
+    memcpy(out_ptr, features + offset, length * sizeof(float));
+    return 0;
+}
+
+// --- SETUP ---
+void setup() {
+    Serial.begin(115200);
+    
+    // Cấu hình chân Mic
+    pinMode(PIN_MIC_L_POWER, OUTPUT);
+    digitalWrite(PIN_MIC_L_POWER, LOW);
+
+    // KẾT NỐI WIFI NGAY TỪ ĐẦU
+    Serial.print("Đang kết nối WiFi");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi đã kết nối! (Sẽ giữ kết nối liên tục)");
+
+    setupI2S();
+    Serial.println("Hệ thống sẵn sàng...");
+}
+
+// --- LOOP ---
+void loop() {
+    // 1. Thu âm
+    recordAudio();
+
+    // 2. Phân tích AI
+    signal_t signal;
+    signal.total_length = EI_SAMPLE_COUNT;
+    signal.get_data = &raw_feature_get_data;
+    ei_impulse_result_t result = { 0 };
+    
+    // Run classifier
+    EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
+    if (res != EI_IMPULSE_OK) {
+        Serial.println("Lỗi Classifier!");
+        return;
+    }
+
+    // 3. Tìm kết quả tốt nhất
+    String bestLabel = "";
+    float bestScore = 0.0;
+
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        if (result.classification[ix].value > bestScore) {
+            bestScore = result.classification[ix].value;
+            bestLabel = String(result.classification[ix].label);
+        }
+    }
+
+    // 4. Kiểm tra ngưỡng và gửi tin nhắn
+    if (bestScore > 0.6) {
+        Serial.println("Phát hiện: " + bestLabel + " (" + String(bestScore * 100, 1) + "%)");
+        
+        String msg = "Phát hiện: " + bestLabel + " - Độ tin cậy: " + String(bestScore * 100, 1) + "%";
+        sendTelegram(msg); // Hàm này sẽ tự động thử lại nếu lỗi
+    } else {
+        Serial.println("Không rõ nguồn âm (" + String(bestScore * 100, 1) + "%)");
+    }
+
+    // Delay ngắn để tiếp tục vòng lặp nhanh hơn
+    Serial.println("Nghỉ 1s...");
+    delay(1000); 
+}
 
