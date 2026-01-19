@@ -3,9 +3,6 @@
 #include <WiFiClientSecure.h>
 #include <driver/i2s.h>
 
-// >>> QUAN TRỌNG: ĐỔI TÊN THƯ VIỆN NÀY THEO THƯ VIỆN CỦA BẠN <<<
-#include <Ph_n_lo_i_ti_ng_n_trong_l_p_h_c_inferencing.h>
-
 // --- 1. CẤU HÌNH WIFI & TELEGRAM ---
 const char* ssid = "TEN_WIFI_NHA_BAN";
 const char* password = "MAT_KHAU_WIFI";
@@ -16,21 +13,43 @@ const char* chatID = "8519338843";
 #define I2S_SD      10
 #define I2S_WS      11
 #define I2S_SCK     12
-#define PIN_MIC_L_POWER  4  // Chân nguồn Mic Trái
+#define PIN_MIC_L_POWER  4 
 
 // --- 3. CẤU HÌNH ÂM THANH ---
 #define SAMPLE_RATE     16000
 #define RECORD_TIME_SEC 2
-#define EI_SAMPLE_COUNT (SAMPLE_RATE * RECORD_TIME_SEC)
+#define BIT_PER_SAMPLE  16
+// Tổng số mẫu = 16000 mẫu/s * 2s = 32000 mẫu
+#define TOTAL_SAMPLES   (SAMPLE_RATE * RECORD_TIME_SEC)
+// Kích thước dữ liệu (bytes) = Số mẫu * 2 (vì 16bit = 2 bytes)
+#define DATA_SIZE       (TOTAL_SAMPLES * 2)
 
-float features[EI_SAMPLE_COUNT];
+// Buffer lưu dữ liệu thô (cấp phát tĩnh để tránh phân mảnh RAM)
+int16_t audioBuffer[TOTAL_SAMPLES];
 
-// Cấu hình I2S (Chỉ đọc kênh Trái - Mono)
+// Cấu trúc Wav Header (44 bytes)
+struct WavHeader {
+  char riff[4];           // "RIFF"
+  uint32_t overallSize;   // File size - 8
+  char wave[4];           // "WAVE"
+  char fmtChunkMarker[4]; // "fmt "
+  uint32_t lengthOfFmt;   // 16
+  uint16_t formatType;    // 1 (PCM)
+  uint16_t channels;      // 1 (Mono)
+  uint32_t sampleRate;    // 16000
+  uint32_t byteRate;      // sampleRate * bytesPerSample * channels
+  uint16_t blockAlign;    // bytesPerSample * channels
+  uint16_t bitsPerSample; // 16
+  char dataChunkHeader[4];// "data"
+  uint32_t dataSize;      // Kích thước dữ liệu âm thanh
+};
+
+// Cấu hình I2S
 i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, 
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // Mono Mic Trái
     .communication_format = I2S_COMM_FORMAT_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
@@ -49,162 +68,142 @@ i2s_pin_config_t pin_config = {
 void setupI2S() {
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_config);
-    i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+// --- HÀM TẠO HEADER WAV ---
+WavHeader createWavHeader(int sampleRate, int dataSize) {
+    WavHeader header;
+    memcpy(header.riff, "RIFF", 4);
+    header.overallSize = dataSize + 36;
+    memcpy(header.wave, "WAVE", 4);
+    memcpy(header.fmtChunkMarker, "fmt ", 4);
+    header.lengthOfFmt = 16;
+    header.formatType = 1; // PCM
+    header.channels = 1;   // Mono
+    header.sampleRate = sampleRate;
+    header.bitsPerSample = 16;
+    header.byteRate = sampleRate * 1 * 2; // rate * channels * bytes per sample
+    header.blockAlign = 2; // channels * bytes per sample
+    memcpy(header.dataChunkHeader, "data", 4);
+    header.dataSize = dataSize;
+    return header;
 }
 
 // --- HÀM THU ÂM ---
-bool recordAudio() {
-    Serial.println("--- Đang thu âm... ---");
-    // Bật Mic
+void recordAudio() {
+    Serial.println("--- Bắt đầu thu âm 2s ---");
     digitalWrite(PIN_MIC_L_POWER, HIGH);
-    delay(50); // Chờ mic ổn định
-    
-    // Xóa buffer cũ
+    delay(50); 
     i2s_zero_dma_buffer(I2S_NUM_0);
 
     size_t bytesRead;
-    int16_t sampleBuffer[1]; // Buffer 1 mẫu (vì là Mono)
+    // Đọc trực tiếp vào audioBuffer
+    // Lưu ý: i2s_read đọc theo byte, buffer là int16_t nên size là TOTAL_SAMPLES * 2
+    i2s_read(I2S_NUM_0, (char*)audioBuffer, DATA_SIZE, &bytesRead, portMAX_DELAY);
     
-    for (int i = 0; i < EI_SAMPLE_COUNT; i++) {
-        // Đọc 2 byte
-        i2s_read(I2S_NUM_0, &sampleBuffer, sizeof(sampleBuffer), &bytesRead, portMAX_DELAY);
-        if (bytesRead == 2) {
-            features[i] = (float)sampleBuffer[0];
-        } else {
-            features[i] = 0;
-        }
-    }
-    
-    // Tắt Mic sau khi thu xong
-    digitalWrite(PIN_MIC_L_POWER, LOW); 
-    return true;
+    digitalWrite(PIN_MIC_L_POWER, LOW);
+    Serial.println("--- Đã thu xong ---");
 }
 
-// --- HÀM GỬI TELEGRAM (CÓ THỬ LẠI KHI LỖI) ---
-void sendTelegram(String message) {
-    int maxRetries = 3; // Thử tối đa 3 lần
-    int attempt = 0;
-    bool sentSuccess = false;
+// --- HÀM GỬI FILE WAV LÊN TELEGRAM ---
+void sendVoiceToTelegram() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Mất WiFi, đang kết nối lại...");
+        WiFi.reconnect();
+        delay(2000);
+        if (WiFi.status() != WL_CONNECTED) return;
+    }
 
-    Serial.println("Chuẩn bị gửi Telegram...");
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(10000); // 10s timeout cho việc upload
 
-    while (attempt < maxRetries && !sentSuccess) {
-        attempt++;
+    Serial.println("Đang upload file lên Telegram...");
+
+    if (client.connect("api.telegram.org", 443)) {
+        // Tạo Boundary ngẫu nhiên
+        String boundary = "------------------------Esp32Boundary";
         
-        // 1. Kiểm tra kết nối mạng
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.printf("Mất WiFi. Đang nối lại (Lần %d)...\n", attempt);
-            WiFi.reconnect();
-            // Chờ tối đa 3s để nối lại WiFi
-            long startWait = millis();
-            while (WiFi.status() != WL_CONNECTED && (millis() - startWait < 3000)) {
-                delay(100);
-            }
+        // Chuẩn bị Header của file WAV
+        WavHeader wavHead = createWavHeader(SAMPLE_RATE, DATA_SIZE);
+
+        // Body phần đầu (Metadata)
+        String head = "--" + boundary + "\r\n" +
+                      "Content-Disposition: form-data; name=\"audio\"; filename=\"voice.wav\"\r\n" +
+                      "Content-Type: audio/x-wav\r\n\r\n";
+        
+        // Body phần đuôi
+        String tail = "\r\n--" + boundary + "--\r\n";
+
+        // Tính tổng dung lượng Content-Length
+        // = Head + WavHeader (44 bytes) + RawData + Tail
+        size_t contentLength = head.length() + 44 + DATA_SIZE + tail.length();
+
+        // Gửi HTTP Header
+        client.println("POST /bot" + String(botToken) + "/sendAudio?chat_id=" + String(chatID) + " HTTP/1.1");
+        client.println("Host: api.telegram.org");
+        client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+        client.println("Content-Length: " + String(contentLength));
+        client.println("Connection: close");
+        client.println(); // Dòng trống kết thúc header
+
+        // Gửi HTTP Body
+        // 1. Gửi Head text
+        client.print(head);
+        
+        // 2. Gửi Wav Header (Binary)
+        client.write((uint8_t*)&wavHead, sizeof(wavHead));
+        
+        // 3. Gửi Dữ liệu âm thanh (Binary)
+        // Gửi từng chunk nhỏ để tránh lỗi đường truyền
+        client.write((uint8_t*)audioBuffer, DATA_SIZE);
+
+        // 4. Gửi Tail
+        client.print(tail);
+
+        Serial.println("Đã gửi xong data. Đang chờ phản hồi...");
+
+        // Đọc phản hồi (quan trọng để biết thành công hay thất bại)
+        while (client.connected()) {
+            String line = client.readStringUntil('\n');
+            if (line == "\r") break; // Hết header
         }
-
-        // 2. Thực hiện gửi nếu có mạng
-        if (WiFi.status() == WL_CONNECTED) {
-            WiFiClientSecure client;
-            client.setInsecure(); // Bỏ qua SSL check
-            client.setTimeout(5000); // Timeout 5s
-
-            if (client.connect("api.telegram.org", 443)) {
-                String url = "/bot" + String(botToken) + "/sendMessage?chat_id=" + String(chatID) + "&text=" + message;
-                
-                client.print(String("GET ") + url + " HTTP/1.1\r\n" +
-                             "Host: api.telegram.org\r\n" + 
-                             "Connection: close\r\n\r\n");
-                
-                // Đọc phản hồi để xác nhận server đã nhận
-                while (client.connected()) {
-                    String line = client.readStringUntil('\n');
-                    if (line == "\r") break;
-                }
-                
-                Serial.println("-> Đã gửi thành công!");
-                sentSuccess = true; 
-            } else {
-                Serial.println("-> Lỗi kết nối Telegram Server. Đang thử lại...");
-                delay(1000);
-            }
-        } else {
-            Serial.println("-> Không thể kết nối WiFi.");
-        }
-    }
-
-    if (!sentSuccess) {
-        Serial.println("!!! GỬI THẤT BẠI SAU 3 LẦN THỬ -> BỎ QUA !!!");
+        // Đọc 1 chút body response để clear buffer
+        client.readStringUntil('}'); 
+        Serial.println("Upload hoàn tất!");
+        
+        client.stop();
+    } else {
+        Serial.println("Kết nối server thất bại");
     }
 }
 
-// --- CALLBACK CHO EDGE IMPULSE ---
-int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
-    memcpy(out_ptr, features + offset, length * sizeof(float));
-    return 0;
-}
-
-// --- SETUP ---
 void setup() {
     Serial.begin(115200);
     
-    // Cấu hình chân Mic
+    // Cấu hình Mic
     pinMode(PIN_MIC_L_POWER, OUTPUT);
     digitalWrite(PIN_MIC_L_POWER, LOW);
 
-    // KẾT NỐI WIFI NGAY TỪ ĐẦU
-    Serial.print("Đang kết nối WiFi");
+    // Kết nối WiFi (giữ luôn kết nối)
+    Serial.print("Kết nối WiFi");
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
+        delay(500); Serial.print(".");
     }
-    Serial.println("\nWiFi đã kết nối! (Sẽ giữ kết nối liên tục)");
+    Serial.println("\nWiFi OK!");
 
     setupI2S();
-    Serial.println("Hệ thống sẵn sàng...");
 }
 
-// --- LOOP ---
 void loop() {
     // 1. Thu âm
     recordAudio();
 
-    // 2. Phân tích AI
-    signal_t signal;
-    signal.total_length = EI_SAMPLE_COUNT;
-    signal.get_data = &raw_feature_get_data;
-    ei_impulse_result_t result = { 0 };
-    
-    // Run classifier
-    EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
-    if (res != EI_IMPULSE_OK) {
-        Serial.println("Lỗi Classifier!");
-        return;
-    }
+    // 2. Gửi file
+    sendVoiceToTelegram();
 
-    // 3. Tìm kết quả tốt nhất
-    String bestLabel = "";
-    float bestScore = 0.0;
-
-    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-        if (result.classification[ix].value > bestScore) {
-            bestScore = result.classification[ix].value;
-            bestLabel = String(result.classification[ix].label);
-        }
-    }
-
-    // 4. Kiểm tra ngưỡng và gửi tin nhắn
-    if (bestScore > 0.6) {
-        Serial.println("Phát hiện: " + bestLabel + " (" + String(bestScore * 100, 1) + "%)");
-        
-        String msg = "Phát hiện: " + bestLabel + " - Độ tin cậy: " + String(bestScore * 100, 1) + "%";
-        sendTelegram(msg); // Hàm này sẽ tự động thử lại nếu lỗi
-    } else {
-        Serial.println("Không rõ nguồn âm (" + String(bestScore * 100, 1) + "%)");
-    }
-
-    // Delay ngắn để tiếp tục vòng lặp nhanh hơn
-    Serial.println("Nghỉ 1s...");
-    delay(1000); 
+    // 3. Nghỉ 1 chút (tránh spam quá nhanh làm Telegram chặn)
+    Serial.println("Nghỉ 2s trước khi thu tiếp...");
+    delay(2000);
 }
-
