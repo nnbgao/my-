@@ -1,0 +1,297 @@
+#include <Ph_n_lo_i_ti_ng_n_trong_l_p_h_c_b_n_ch_nh_inferencing.h> // Thư viện Edge Impulse của bạn
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <driver/i2s.h>
+#include <esp_wifi.h> 
+
+// ================= CONFIG =================
+#define WIFI_SSID     "TEN_WIFI"
+#define WIFI_PASS     "MAT_KHAU"
+#define BOT_TOKEN     "XXXXXXXXX:AAAAA"
+#define CHAT_ID       "123456789"
+
+// --- CẤU HÌNH ÂM THANH NÂNG CAO ---
+#define DIGITAL_GAIN      4.0   // Nhân âm lượng lên 4 lần (Nếu vẫn nhỏ hãy tăng lên 6.0 hoặc 8.0)
+#define WARMUP_DISCARD_MS 200   // Bỏ 200ms đầu khi mới bật mic để tránh tiếng "Bụp"
+
+// ================= PINS =================
+#define PWR_MIC1  4
+#define PWR_MIC2  5
+#define PWR_MIC3  6
+
+// I2S PORT 0 - Mic 1 & 2
+#define I2S0_BCLK 14
+#define I2S0_WS   15
+#define I2S0_SD   16
+
+// I2S PORT 1 - Mic 3
+#define I2S1_BCLK 17
+#define I2S1_WS   18
+#define I2S1_SD   21
+
+#define SAMPLE_RATE     16000
+#define RECORD_SEC      3
+#define EI_SAMPLE_COUNT (SAMPLE_RATE * RECORD_SEC)
+
+// ================= GLOBALS =================
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+
+float noise_floor_dB = 60.0;
+float trigger_threshold = 10.0;
+int16_t *audio_buffer;
+
+enum State { MONITOR, RECORD, AI_INFERENCE, SEND_TELEGRAM, RESET };
+State state = MONITOR;
+
+int selected_mic_pwr = 0;
+int selected_i2s_port = 0;
+int selected_i2s_channel = 0;
+
+// ================= UTILS =================
+void setPowerAll(bool on) {
+    digitalWrite(PWR_MIC1, on ? HIGH : LOW);
+    digitalWrite(PWR_MIC2, on ? HIGH : LOW);
+    digitalWrite(PWR_MIC3, on ? HIGH : LOW);
+    if (on) delay(60); // Warm-up điện
+}
+
+void setPowerSingle(int micPin) {
+    digitalWrite(PWR_MIC1, LOW);
+    digitalWrite(PWR_MIC2, LOW);
+    digitalWrite(PWR_MIC3, LOW);
+    digitalWrite(micPin, HIGH);
+    delay(60); // Warm-up điện
+}
+
+// --- HÀM XỬ LÝ DỮ LIỆU (GAIN + LIMITER + NORMALIZE) ---
+int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
+    float sum = 0;
+    
+    // 1. Tính trung bình (DC Offset)
+    for (size_t i = 0; i < length; i++) {
+        sum += (float)audio_buffer[offset + i];
+    }
+    float mean = sum / length;
+
+    for (size_t i = 0; i < length; i++) {
+        // 2. Trừ DC Offset
+        float val = (float)audio_buffer[offset + i] - mean;
+
+        // 3. APPLY GAIN (Khuếch đại)
+        val *= DIGITAL_GAIN;
+
+        // 4. LIMITER (Chống tràn số)
+        // Kẹp giá trị trong khoảng int16_t (-32768 đến 32767)
+        if (val > 32767.0f) val = 32767.0f;
+        else if (val < -32768.0f) val = -32768.0f;
+
+        // 5. Chuẩn hóa về -1.0 đến 1.0 cho AI
+        out_ptr[i] = val / 32768.0f;
+    }
+    return 0;
+}
+
+void setupI2S() {
+    i2s_config_t i2s_conf = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 256,
+        .use_apll = false
+    };
+
+    i2s_driver_install(I2S_NUM_0, &i2s_conf, 0, NULL);
+    i2s_driver_install(I2S_NUM_1, &i2s_conf, 0, NULL);
+
+    i2s_pin_config_t pin0 = { .bck_io_num=I2S0_BCLK, .ws_io_num=I2S0_WS, .data_out_num=-1, .data_in_num=I2S0_SD };
+    i2s_pin_config_t pin1 = { .bck_io_num=I2S1_BCLK, .ws_io_num=I2S1_WS, .data_out_num=-1, .data_in_num=I2S1_SD };
+
+    i2s_set_pin(I2S_NUM_0, &pin0);
+    i2s_set_pin(I2S_NUM_1, &pin1);
+}
+
+// ================= MAIN SETUP =================
+void setup() {
+    Serial.begin(115200);
+    
+    pinMode(PWR_MIC1, OUTPUT);
+    pinMode(PWR_MIC2, OUTPUT);
+    pinMode(PWR_MIC3, OUTPUT);
+    
+    audio_buffer = (int16_t*)malloc(EI_SAMPLE_COUNT * sizeof(int16_t));
+    if (!audio_buffer) { Serial.println("RAM ERR"); while(1); }
+
+    setupI2S();
+
+    Serial.print("Connecting WiFi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+    
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500); Serial.print(".");
+    }
+    Serial.println("OK");
+
+    WiFi.setSleep(false); // Tắt tiết kiệm pin để sóng khỏe
+    setPowerAll(true);
+    state = MONITOR;
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+    switch (state) {
+        case MONITOR: {
+            size_t bytes0, bytes1;
+            int16_t buf0[512], buf1[512];
+            
+            // Đọc mẫu ngắn để đo cường độ
+            i2s_read(I2S_NUM_0, buf0, 512, &bytes0, portMAX_DELAY);
+            i2s_read(I2S_NUM_1, buf1, 512, &bytes1, portMAX_DELAY);
+
+            double sum1=0, sum2=0, sum3=0;
+            int count = bytes0/4; 
+            for(int i=0; i<count; i++) {
+                int16_t s1 = buf0[i*2]; int16_t s2 = buf0[i*2+1]; int16_t s3 = buf1[i*2]; 
+                sum1+=s1*s1; sum2+=s2*s2; sum3+=s3*s3;
+            }
+            float rms1=sqrt(sum1/count), rms2=sqrt(sum2/count), rms3=sqrt(sum3/count);
+            float max_rms = max(rms1, max(rms2, rms3));
+            float db = 20 * log10(max_rms + 1);
+
+            noise_floor_dB = 0.9 * noise_floor_dB + 0.1 * db;
+
+            if (db > (noise_floor_dB + trigger_threshold)) {
+                // Chọn Mic có âm thanh lớn nhất
+                if (rms1 >= rms2 && rms1 >= rms3) { selected_mic_pwr = PWR_MIC1; selected_i2s_port = 0; selected_i2s_channel = 0; }
+                else if (rms2 >= rms1 && rms2 >= rms3) { selected_mic_pwr = PWR_MIC2; selected_i2s_port = 0; selected_i2s_channel = 1; }
+                else { selected_mic_pwr = PWR_MIC3; selected_i2s_port = 1; selected_i2s_channel = 0; }
+                state = RECORD;
+            } else {
+                if(WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+                delay(50);
+            }
+            break;
+        }
+
+        case RECORD: {
+            Serial.println("Recording...");
+            
+            // 1. Tắt WiFi (Giảm nhiễu RF)
+            esp_wifi_stop(); 
+
+            // 2. Chỉ cấp nguồn Mic đã chọn
+            setPowerSingle(selected_mic_pwr);
+            
+            // 3. Xóa Buffer DMA
+            if(selected_i2s_port == 0) i2s_zero_dma_buffer(I2S_NUM_0);
+            else i2s_zero_dma_buffer(I2S_NUM_1);
+
+            // 4. DATA WARM-UP (Đọc bỏ dữ liệu rác ban đầu)
+            // Tính số vòng lặp cần bỏ qua dựa trên thời gian WARMUP_DISCARD_MS
+            size_t bytes_discard;
+            uint8_t trash_buf[512]; 
+            // Công thức: (SampleRate * 2 bytes * seconds) / buffer_size
+            int discard_loops = (SAMPLE_RATE * 2 * (WARMUP_DISCARD_MS / 1000.0)) / 512;
+            
+            for(int k=0; k < discard_loops; k++) {
+                 if (selected_i2s_port == 0) i2s_read(I2S_NUM_0, trash_buf, 512, &bytes_discard, 10);
+                 else i2s_read(I2S_NUM_1, trash_buf, 512, &bytes_discard, 10);
+            }
+
+            // 5. Thu âm chính thức
+            size_t bytesRead;
+            int16_t tempBuf[512];
+            int idx = 0;
+            
+            while (idx < EI_SAMPLE_COUNT) {
+                if (selected_i2s_port == 0) i2s_read(I2S_NUM_0, tempBuf, sizeof(tempBuf), &bytesRead, portMAX_DELAY);
+                else i2s_read(I2S_NUM_1, tempBuf, sizeof(tempBuf), &bytesRead, portMAX_DELAY);
+
+                int samples = bytesRead / 2;
+                for (int i=0; i<samples; i+=2) { 
+                    if (idx < EI_SAMPLE_COUNT) {
+                        if (selected_i2s_channel == 0) audio_buffer[idx++] = tempBuf[i];   
+                        else audio_buffer[idx++] = tempBuf[i+1]; 
+                    }
+                }
+            }
+
+            // 6. Bật lại WiFi
+            esp_wifi_start();
+            delay(100); // Đợi WiFi PHY ổn định
+
+            state = AI_INFERENCE;
+            break;
+        }
+
+        case AI_INFERENCE: {
+            Serial.println("Inferencing...");
+            
+            // Tạo cấu trúc tín hiệu cho Edge Impulse
+            signal_t signal;
+            signal.total_length = EI_SAMPLE_COUNT;
+            // Trỏ vào hàm đã có Gain/Limiter
+            signal.get_data = &raw_feature_get_data; 
+            
+            ei_impulse_result_t result = {0};
+            
+            // Chạy phân loại
+            EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
+            
+            if (res != EI_IMPULSE_OK) {
+                Serial.printf("ERR: %d\n", res);
+                state = RESET;
+                break;
+            }
+
+            // In kết quả
+            float max_score = 0;
+            String label = "";
+            for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+                Serial.printf("%s: %.5f\n", result.classification[ix].label, result.classification[ix].value);
+                if(result.classification[ix].value > max_score) {
+                    max_score = result.classification[ix].value;
+                    label = String(result.classification[ix].label);
+                }
+            }
+
+            // Ngưỡng tin cậy (Confidence threshold) > 0.6 thì gửi tin nhắn
+            if (max_score > 0.6 && label != "noise" && label != "background") {
+                 // Gửi tin nhắn
+                 state = SEND_TELEGRAM;
+            } else {
+                 state = RESET;
+            }
+            break;
+        }
+
+        case SEND_TELEGRAM: {
+            // Đợi WiFi kết nối lại (vì vừa bật lại)
+            int retry = 0;
+            while(WiFi.status() != WL_CONNECTED && retry < 40) {
+                delay(100); retry++;
+            }
+
+            if(WiFi.status() == WL_CONNECTED) {
+                bot.sendMessage(CHAT_ID, "⚠️ Phát hiện âm thanh lạ!", "");
+            }
+            state = RESET;
+            break;
+        }
+
+        case RESET: {
+            delay(500);
+            setPowerAll(true); // Bật lại tất cả mic để tiếp tục nghe ngóng
+            state = MONITOR;
+            break;
+        }
+    }
+}
