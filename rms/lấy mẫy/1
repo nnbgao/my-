@@ -4,34 +4,32 @@
 #include <driver/i2s.h>
 
 // ================= 1. CẤU HÌNH WIFI & TELEGRAM =================
-const char* ssid = "I002";
-const char* password = "THTH2024";
+const char* ssid = "Nguyen Ngoc";
+const char* password = "03032001";
+// Token và ChatID của bạn
 const char* botToken = "8521958601:AAF3a6g7xJNuRWq3ymr6CcaDS5X2sU2-aFM"; 
 const char* chatID = "8519338843"; 
 
-// ================= 2. CẤU HÌNH CHÂN (CHUẨN VIETDUINO ESP32S3) =================
-// Cắm đúng vào hàng lỗ bên trái (từ trên xuống):
-// SCK -> cắm vào D13 (Code gọi là GPIO 12)
-#define I2S_SCK     12 
+// ================= 2. CẤU HÌNH CHÂN (THEO CODE BẠN GỬI) =================
+// SCK -> GPIO 14
+#define I2S_SCK     14 
+// WS  -> GPIO 15 
+#define I2S_WS      15 
+// SD  -> GPIO 16
+#define I2S_SD      16 
 
-// VDD -> cắm vào D12 (Code gọi là GPIO 13) - Dùng làm nguồn nuôi Mic
-#define PIN_MIC_POWER  13 
+// LƯU Ý PHẦN CỨNG: 
+// - VDD Mic -> 3.3V
+// - GND Mic -> GND
+// - L/R Mic -> GND (Để chọn kênh trái/Only Left)
 
-// WS  -> cắm vào D11 (Code gọi là GPIO 11)
-#define I2S_WS      11 
-
-// SD  -> cắm vào D10 (Code gọi là GPIO 10)
-#define I2S_SD      10 
-
-// LƯU Ý: Chân L/R và GND của Mic phải nối chung vào GND của mạch!
-
-// ================= 3. CẤU HÌNH ÂM THANH (ĐÃ FIX LỖI MẤT TIẾNG) =================
+// ================= 3. CẤU HÌNH ÂM THANH =================
 #define SAMPLE_RATE     16000
 #define RECORD_TIME_SEC 2      // Thu 2 giây
-#define GAIN_FACTOR     10     // [FIX 1] Nhân to gấp 10 lần để nghe rõ
+#define GAIN_FACTOR     10     // Tăng âm lượng
 
 #define TOTAL_SAMPLES   (SAMPLE_RATE * RECORD_TIME_SEC)
-#define DATA_SIZE       (TOTAL_SAMPLES * 2)
+#define DATA_SIZE       (TOTAL_SAMPLES * 2) // 2 byte mỗi mẫu
 
 int16_t audioBuffer[TOTAL_SAMPLES];
 
@@ -47,7 +45,7 @@ i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // Chỉ đọc kênh Trái (Nên bắt buộc L/R nối GND)
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, 
     .communication_format = I2S_COMM_FORMAT_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
@@ -77,130 +75,141 @@ WavHeader createWavHeader(int sampleRate, int dataSize) {
     return header;
 }
 
-// --- HÀM THU ÂM (ĐÃ CÓ WARM-UP & GAIN) ---
+// --- HÀM THU ÂM ---
 void recordAudio() {
-    Serial.println("\n--- Bắt đầu quy trình thu âm ---");
+    Serial.println("\n--- Bắt đầu thu âm ---");
     
-    // 1. Bật nguồn Mic
-    digitalWrite(PIN_MIC_POWER, HIGH);
-    Serial.println("Mic ON. Đang chờ ổn định (Warm-up)...");
-    
-    // [FIX 2] Chờ 0.5s để mic hết bị đơ lúc mới bật
-    delay(500); 
-
-    // 2. Xóa buffer rác
+    // Xóa buffer I2S để tránh nhiễu cũ
     i2s_zero_dma_buffer(I2S_NUM_0);
+    delay(100); 
 
-    // 3. Thu âm
+    // Thu âm
     size_t bytesRead;
-    Serial.println("Đang thu dữ liệu...");
     i2s_read(I2S_NUM_0, (char*)audioBuffer, DATA_SIZE, &bytesRead, portMAX_DELAY);
     
-    // 4. Tắt Mic
-    digitalWrite(PIN_MIC_POWER, LOW);
-    Serial.println("Thu xong. Mic OFF.");
-
-    // 5. KHUẾCH ĐẠI (GAIN) - QUAN TRỌNG NHẤT
-    Serial.println("Đang khuếch đại âm lượng...");
-    long sum = 0; // Biến kiểm tra xem có thu được gì không
-    
+    // Xử lý Gain (Khuếch đại)
+    long sum = 0; 
     for (int i = 0; i < TOTAL_SAMPLES; i++) {
         int32_t val = audioBuffer[i];
-        
-        // Cộng dồn để kiểm tra tín hiệu (Debug)
         sum += abs(val);
-
-        // Nhân to lên
         val = val * GAIN_FACTOR; 
-
-        // Cắt ngọn nếu to quá
         if (val > 32767) val = 32767;
         if (val < -32768) val = -32768;
-
         audioBuffer[i] = (int16_t)val;
     }
     
-    // In ra màn hình để biết Mic sống hay chết
-    Serial.print(">>> TỔNG NĂNG LƯỢNG THU ĐƯỢC: ");
+    Serial.print("Thu xong. Năng lượng tín hiệu: ");
     Serial.println(sum);
-    if(sum == 0) Serial.println("⚠️ CẢNH BÁO: MIC KHÔNG THU ĐƯỢC GÌ (Kiểm tra dây L/R nối GND chưa?)");
-    else if (sum < 10000) Serial.println("⚠️ CẢNH BÁO: Tín hiệu quá nhỏ, hãy nói to hơn hoặc tăng GAIN_FACTOR.");
-    else Serial.println("✅ Tín hiệu tốt!");
 }
 
-// --- HÀM GỬI FILE ---
+// --- HÀM GỬI FILE (ĐÃ SỬA LỖI HTTP) ---
 void sendVoiceToTelegram() {
+    // Chỉ kết nối lại nếu mất mạng, không tắt bật liên tục
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Mất WiFi, đang kết nối lại...");
+        Serial.println("Mất kết nối! Đang kết nối lại WiFi...");
         WiFi.reconnect();
-        delay(2000);
-        if (WiFi.status() != WL_CONNECTED) return;
+        unsigned long start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+            delay(100); Serial.print(".");
+        }
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("\nKhông thể kết nối WiFi. Bỏ qua lần gửi này.");
+            return;
+        }
+        Serial.println("\nWiFi đã kết nối lại.");
     }
 
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(20000); 
+    client.setInsecure(); // Bỏ qua kiểm tra chứng chỉ SSL
+    client.setTimeout(20000); // Timeout 20 giây
 
-    Serial.println("Đang upload file lên Telegram...");
+    Serial.println("Đang kết nối tới Telegram...");
 
     if (client.connect("api.telegram.org", 443)) {
+        Serial.println("Đã kết nối Server. Đang gửi dữ liệu...");
+        
         String boundary = "Esp32Boundary";
         WavHeader wavHead = createWavHeader(SAMPLE_RATE, DATA_SIZE);
 
+        // Chuẩn bị Header và Tail của HTTP Multipart
         String head = "--" + boundary + "\r\n" +
-                      "Content-Disposition: form-data; name=\"audio\"; filename=\"vietduino_mic.wav\"\r\n" +
+                      "Content-Disposition: form-data; name=\"audio\"; filename=\"esp32_audio.wav\"\r\n" +
                       "Content-Type: audio/x-wav\r\n\r\n";
         String tail = "\r\n--" + boundary + "--\r\n";
 
-        size_t contentLength = head.length() + 44 + DATA_SIZE + tail.length();
+        // Tính chính xác độ dài Content-Length
+        uint32_t contentLength = head.length() + sizeof(wavHead) + DATA_SIZE + tail.length();
 
+        // Gửi Header HTTP
         client.println("POST /bot" + String(botToken) + "/sendAudio?chat_id=" + String(chatID) + " HTTP/1.1");
         client.println("Host: api.telegram.org");
         client.println("Content-Type: multipart/form-data; boundary=" + boundary);
         client.println("Content-Length: " + String(contentLength));
-        client.println("Connection: close");
+        client.println("Connection: keep-alive");
         client.println();
 
+        // Gửi Body Multipart
         client.print(head);
         client.write((uint8_t*)&wavHead, sizeof(wavHead));
-        client.write((uint8_t*)audioBuffer, DATA_SIZE); 
+
+        // CHIA NHỎ DỮ LIỆU ĐỂ GỬI (Chunking) - Fix lỗi tràn bộ đệm gửi
+        uint8_t *pData = (uint8_t*)audioBuffer;
+        size_t remaining = DATA_SIZE;
+        size_t chunkSize = 1024; // Gửi mỗi lần 1KB
+
+        while (remaining > 0) {
+            size_t toSend = (remaining > chunkSize) ? chunkSize : remaining;
+            client.write(pData, toSend);
+            pData += toSend;
+            remaining -= toSend;
+            // Delay cực nhỏ để Watchdog không reset nếu mạng chậm
+            delay(0); 
+        }
+
         client.print(tail);
 
+        // Đọc phản hồi từ Telegram để Debug
+        Serial.println("Đã gửi xong. Đang chờ phản hồi...");
         while (client.connected()) {
             String line = client.readStringUntil('\n');
-            if (line == "\r") break;
+            if (line == "\r") break; // Hết header
         }
-        client.readStringUntil('}'); 
-        Serial.println("-> Upload thành công!");
+        
+        // Đọc Body JSON trả về
+        String response = client.readString();
+        Serial.println("Phản hồi từ Telegram:");
+        Serial.println(response); // <--- QUAN TRỌNG: Xem lỗi ở đây nếu có
+
         client.stop();
     } else {
-        Serial.println("-> Lỗi kết nối Server!");
+        Serial.println("-> Lỗi: Không thể kết nối tới api.telegram.org (Check mạng/DNS)");
     }
 }
 
 void setup() {
     Serial.begin(115200);
     
-    // Cấu hình chân nguồn Mic
-    pinMode(PIN_MIC_POWER, OUTPUT);
-    digitalWrite(PIN_MIC_POWER, LOW);
-
-    Serial.print("Đang kết nối WiFi");
+    // Kết nối WiFi một lần duy nhất ở đây
+    Serial.print("Đang kết nối WiFi: ");
+    Serial.println(ssid);
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500); Serial.print(".");
     }
     Serial.println("\nWiFi đã kết nối!");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
 
+    // Cài đặt I2S
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_config);
     
-    Serial.println("Hệ thống sẵn sàng! Hãy mở Serial Monitor để xem mic có thu được tín hiệu không.");
+    Serial.println("Hệ thống sẵn sàng!");
 }
 
 void loop() {
     recordAudio();
     sendVoiceToTelegram();
-    Serial.println("Nghỉ 2 giây...");
-    delay(2000);
+    
+    Serial.println("Chờ 5 giây trước khi thu tiếp...");
+    delay(5000); // Tăng delay lên một chút để tránh spam server quá nhanh
 }
