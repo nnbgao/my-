@@ -1,0 +1,304 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <Ph_n_lo_i_ti_ng_n_trong_l_p_h_c_b_n_ch_nh_inferencing.h>
+
+// ================= CONFIG FIREBASE =================
+#define WIFI_SSID     "TEN_WIFI"
+#define WIFI_PASS     "MAT_KHAU"
+#define FIREBASE_HOST "quan-ly-ung-dung-7aa35-default-rtdb.asia-southeast1.firebasedatabase.app" 
+#define FIREBASE_AUTH "SeApFop6CQsKo3JpytYouT5IeGQtKjaH7qzN0FGP"
+
+// --- CẤU HÌNH ÂM THANH & EMA ---
+#define DIGITAL_GAIN      4.0   
+#define WARMUP_DISCARD_MS 100   // Giảm xuống vì không cần chờ Wifi khởi động lại
+#define EMA_ALPHA         0.2   // Hệ số làm mượt (0.1 = Rất mượt/chậm, 0.8 = Ít mượt/nhanh)
+
+// ================= PINS =================
+#define PWR_MIC1  4
+#define PWR_MIC2  5
+#define PWR_MIC3  6
+
+// I2S PORT 0 - Mic 1 & 2
+#define I2S0_BCLK 14
+#define I2S0_WS   15
+#define I2S0_SD   16
+
+// I2S PORT 1 - Mic 3
+#define I2S1_BCLK 17
+#define I2S1_WS   18
+#define I2S1_SD   21
+
+#define SAMPLE_RATE     16000
+#define RECORD_SEC      3
+#define EI_SAMPLE_COUNT (SAMPLE_RATE * RECORD_SEC)
+
+// ================= GLOBALS =================
+FirebaseData firebaseData;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Biến cho thuật toán Trigger
+float noise_floor_dB = 60.0;     // Ngưỡng nền (tự thích nghi chậm)
+float smoothed_db = 0.0;         // Giá trị dB hiện tại đã qua làm mượt EMA
+float trigger_threshold = 10.0;  // Phải lớn hơn nền 10dB mới kích hoạt
+
+int16_t *audio_buffer;
+String detected_label = "";
+float detected_score = 0.0;
+
+enum State { MONITOR, RECORD, AI_INFERENCE, SEND_FIREBASE, RESET };
+State state = MONITOR;
+
+int selected_mic_pwr = 0;
+int selected_i2s_port = 0;
+int selected_i2s_channel = 0;
+
+// ================= UTILS =================
+void setPowerAll(bool on) {
+    digitalWrite(PWR_MIC1, on ? HIGH : LOW);
+    digitalWrite(PWR_MIC2, on ? HIGH : LOW);
+    digitalWrite(PWR_MIC3, on ? HIGH : LOW);
+    if (on) delay(50); 
+}
+
+void setPowerSingle(int micPin) {
+    digitalWrite(PWR_MIC1, LOW);
+    digitalWrite(PWR_MIC2, LOW);
+    digitalWrite(PWR_MIC3, LOW);
+    digitalWrite(micPin, HIGH);
+    delay(50); 
+}
+
+int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
+    float sum = 0;
+    for (size_t i = 0; i < length; i++) sum += (float)audio_buffer[offset + i];
+    float mean = sum / length;
+    for (size_t i = 0; i < length; i++) {
+        float val = (float)audio_buffer[offset + i] - mean;
+        val *= DIGITAL_GAIN;
+        if (val > 32767.0f) val = 32767.0f;
+        else if (val < -32768.0f) val = -32768.0f;
+        out_ptr[i] = val / 32768.0f;
+    }
+    return 0;
+}
+
+void setupI2S() {
+    i2s_config_t i2s_conf = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 256,
+        .use_apll = false
+    };
+    i2s_driver_install(I2S_NUM_0, &i2s_conf, 0, NULL);
+    i2s_driver_install(I2S_NUM_1, &i2s_conf, 0, NULL);
+    i2s_pin_config_t pin0 = { .bck_io_num=I2S0_BCLK, .ws_io_num=I2S0_WS, .data_out_num=-1, .data_in_num=I2S0_SD };
+    i2s_pin_config_t pin1 = { .bck_io_num=I2S1_BCLK, .ws_io_num=I2S1_WS, .data_out_num=-1, .data_in_num=I2S1_SD };
+    i2s_set_pin(I2S_NUM_0, &pin0);
+    i2s_set_pin(I2S_NUM_1, &pin1);
+}
+
+// ================= MAIN SETUP =================
+void setup() {
+    Serial.begin(115200);
+    
+    pinMode(PWR_MIC1, OUTPUT);
+    pinMode(PWR_MIC2, OUTPUT);
+    pinMode(PWR_MIC3, OUTPUT);
+    
+    audio_buffer = (int16_t*)malloc(EI_SAMPLE_COUNT * sizeof(int16_t));
+    if (!audio_buffer) { Serial.println("RAM ERR"); while(1); }
+
+    setupI2S();
+
+    Serial.print("Connecting WiFi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+    Serial.println("OK");
+
+    config.api_key = "";
+    config.database_url = FIREBASE_HOST;
+    config.signer.tokens.legacy_token = FIREBASE_AUTH;
+    
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+
+    setPowerAll(true);
+    
+    // Khởi tạo giá trị ban đầu cho EMA (để tránh giật cục lúc mới bật)
+    smoothed_db = 40.0; 
+    
+    state = MONITOR;
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+    switch (state) {
+        case MONITOR: {
+            // Đọc mẫu ngắn để đo cường độ
+            size_t bytes0, bytes1;
+            int16_t buf0[512], buf1[512];
+            
+            i2s_read(I2S_NUM_0, buf0, 512, &bytes0, portMAX_DELAY);
+            i2s_read(I2S_NUM_1, buf1, 512, &bytes1, portMAX_DELAY);
+
+            // Tính RMS thô
+            double sum1=0, sum2=0, sum3=0;
+            int count = bytes0/4; 
+            for(int i=0; i<count; i++) {
+                int16_t s1 = buf0[i*2]; int16_t s2 = buf0[i*2+1]; int16_t s3 = buf1[i*2]; 
+                sum1+=s1*s1; sum2+=s2*s2; sum3+=s3*s3;
+            }
+            float rms1=sqrt(sum1/count), rms2=sqrt(sum2/count), rms3=sqrt(sum3/count);
+            float max_rms = max(rms1, max(rms2, rms3));
+            float current_db = 20 * log10(max_rms + 1);
+
+            // --- THUẬT TOÁN EMA (MỚI) ---
+            // Công thức: Value_Moi = (Alpha * Hien_Tai) + ((1 - Alpha) * Cu)
+            smoothed_db = (EMA_ALPHA * current_db) + ((1.0 - EMA_ALPHA) * smoothed_db);
+
+            // Cập nhật Noise Floor (vẫn giữ cập nhật chậm để bám sát môi trường)
+            noise_floor_dB = 0.95 * noise_floor_dB + 0.05 * smoothed_db;
+
+            // Debug plot (bật Serial Plotter để xem đường xanh và đỏ)
+            // Serial.print(current_db); Serial.print(",");
+            // Serial.print(smoothed_db); Serial.print(",");
+            // Serial.println(noise_floor_dB + trigger_threshold);
+
+            // So sánh giá trị ĐÃ LÀM MƯỢT với ngưỡng
+            if (smoothed_db > (noise_floor_dB + trigger_threshold)) {
+                // Chọn Mic tốt nhất dựa trên RMS tức thời (không cần EMA cho việc chọn mic)
+                if (rms1 >= rms2 && rms1 >= rms3) { selected_mic_pwr = PWR_MIC1; selected_i2s_port = 0; selected_i2s_channel = 0; }
+                else if (rms2 >= rms1 && rms2 >= rms3) { selected_mic_pwr = PWR_MIC2; selected_i2s_port = 0; selected_i2s_channel = 1; }
+                else { selected_mic_pwr = PWR_MIC3; selected_i2s_port = 1; selected_i2s_channel = 0; }
+                
+                state = RECORD;
+            } else {
+                // Kiểm tra kết nối wifi định kỳ (nhẹ nhàng)
+                if(WiFi.status() != WL_CONNECTED) {
+                    // Nếu mất mạng thì kệ nó, vẫn monitor, khi nào gửi mới lo reconnect
+                }
+                delay(20); // Delay nhỏ để không chiếm hết CPU
+            }
+            break;
+        }
+
+        case RECORD: {
+            Serial.println("Recording (WiFi ON)...");
+            // ĐÃ BỎ: esp_wifi_stop(); 
+
+            setPowerSingle(selected_mic_pwr);
+            if(selected_i2s_port == 0) i2s_zero_dma_buffer(I2S_NUM_0);
+            else i2s_zero_dma_buffer(I2S_NUM_1);
+
+            // Warm-up data
+            size_t bytes_discard;
+            uint8_t trash_buf[512]; 
+            int discard_loops = (SAMPLE_RATE * 2 * (WARMUP_DISCARD_MS / 1000.0)) / 512;
+            for(int k=0; k < discard_loops; k++) {
+                 if (selected_i2s_port == 0) i2s_read(I2S_NUM_0, trash_buf, 512, &bytes_discard, 10);
+                 else i2s_read(I2S_NUM_1, trash_buf, 512, &bytes_discard, 10);
+            }
+
+            // Thu âm
+            size_t bytesRead;
+            int16_t tempBuf[512];
+            int idx = 0;
+            while (idx < EI_SAMPLE_COUNT) {
+                // WiFi vẫn bật nên có thể I2S sẽ bị trễ xíu, nhưng buffer DMA của ESP32 sẽ gánh được
+                if (selected_i2s_port == 0) i2s_read(I2S_NUM_0, tempBuf, sizeof(tempBuf), &bytesRead, portMAX_DELAY);
+                else i2s_read(I2S_NUM_1, tempBuf, sizeof(tempBuf), &bytesRead, portMAX_DELAY);
+
+                int samples = bytesRead / 2;
+                for (int i=0; i<samples; i+=2) { 
+                    if (idx < EI_SAMPLE_COUNT) {
+                        if (selected_i2s_channel == 0) audio_buffer[idx++] = tempBuf[i];   
+                        else audio_buffer[idx++] = tempBuf[i+1]; 
+                    }
+                }
+            }
+
+            // ĐÃ BỎ: esp_wifi_start();
+            state = AI_INFERENCE;
+            break;
+        }
+
+        case AI_INFERENCE: {
+            Serial.println("Inferencing...");
+            signal_t signal;
+            signal.total_length = EI_SAMPLE_COUNT;
+            signal.get_data = &raw_feature_get_data; 
+            
+            ei_impulse_result_t result = {0};
+            EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
+            
+            if (res != EI_IMPULSE_OK) {
+                Serial.printf("ERR: %d\n", res);
+                state = RESET;
+                break;
+            }
+
+            float max_score = 0;
+            String label = "";
+            for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+                if(result.classification[ix].value > max_score) {
+                    max_score = result.classification[ix].value;
+                    label = String(result.classification[ix].label);
+                }
+            }
+
+            detected_label = label;
+            detected_score = max_score;
+
+            if (max_score > 0.6 && label != "noise" && label != "background") {
+                 state = SEND_FIREBASE; 
+            } else {
+                 state = RESET;
+            }
+            break;
+        }
+
+        case SEND_FIREBASE: {
+            // Kiểm tra nhanh, nếu mất mạng thì thử kết nối lại
+            if(WiFi.status() != WL_CONNECTED) {
+                Serial.println("Lost WiFi, reconnecting...");
+                WiFi.reconnect();
+                int retries = 0;
+                while(WiFi.status() != WL_CONNECTED && retries < 20) { delay(100); retries++; }
+            }
+
+            if(WiFi.status() == WL_CONNECTED) {
+                Serial.println("Sending to Firebase...");
+                FirebaseJson json;
+                json.set("label", detected_label);
+                json.set("confidence", detected_score);
+                json.set("mic_used", selected_mic_pwr);
+                json.set("timestamp", millis()); 
+
+                if (Firebase.pushJSON(firebaseData, "/LichSuPhatHien", json)) {
+                    Serial.println("Sent OK!");
+                } else {
+                    Serial.println("Sent Fail: " + firebaseData.errorReason());
+                }
+            }
+            state = RESET;
+            break;
+        }
+
+        case RESET: {
+            // Không cần delay nhiều vì không chờ WiFi khởi động
+            setPowerAll(true);
+            // Reset lại EMA để tránh giá trị cũ ảnh hưởng lần đo mới
+            // (Tuỳ chọn: nếu muốn nó nhớ lịch sử thì bỏ dòng dưới)
+            // smoothed_db = noise_floor_dB; 
+            state = MONITOR;
+            break;
+        }
+    }
+}
